@@ -416,6 +416,22 @@ function resolveRepoBinding({ eventName, prNumber, sha, beforeSha, baseUsable, b
   return [];
 }
 
+/**
+ * The base a local run's prompt diffs a push against: the one the binding
+ * above measures a push from, so the agent reviews every commit of the push
+ * rather than its last one. Empty for any other event, or with no base at all.
+ * Bitbucket names no base for a push, so this is the commit's parent.
+ */
+function resolveDiffBase({ eventName, beforeSha, baseUsable, baseEmpty, parentSha }) {
+  if (eventName !== 'push') {
+    return '';
+  }
+  if (baseUsable && !baseEmpty && present(beforeSha)) {
+    return String(beforeSha).trim();
+  }
+  return present(parentSha) ? String(parentSha).trim() : '';
+}
+
 // ─── Budgets ─────────────────────────────────────────────────────────────────
 
 /** The CLI's own default, mirrored so the floor is computed from real numbers. */
@@ -553,6 +569,7 @@ function skippedPlan(eventName) {
     target: null,
     needsApp: false,
     canFix: false,
+    diffBase: '',
     verbose: false,
     excludeFiles: false,
     consoleUrl: '',
@@ -696,6 +713,13 @@ function resolvePlan(input) {
     cliArgs,
     canFix,
     needsApp,
+    diffBase: resolveDiffBase({
+      eventName: input.eventName,
+      beforeSha: input.beforeSha,
+      baseUsable: truthy(input.baseUsable),
+      baseEmpty: truthy(input.baseEmpty),
+      parentSha: input.parentSha,
+    }),
     // Two verifications whenever a fix round can run and there is something to
     // restart: the first, then one against the repaired application.
     timeoutFloorMinutes: timeoutFloorMinutes({
@@ -780,6 +804,7 @@ function writeOutputs(plan) {
     ['target_host', plan.target && plan.target.kind === 'tunnel' ? plan.target.host : ''],
     ['needs_app', plan.needsApp ? 'true' : 'false'],
     ['can_fix', plan.canFix ? 'true' : 'false'],
+    ['diff_base', plan.diffBase || ''],
     ['verbose', plan.verbose ? 'true' : 'false'],
     ['exclude_files', plan.excludeFiles ? 'true' : 'false'],
     ['console_url', plan.consoleUrl],
@@ -815,9 +840,28 @@ function emitSecretHeaderArgs() {
   }
 }
 
+/**
+ * Every header the verification sends, plain and secret, one `Name: value` per
+ * line on stdout: the reachability check sends them too, so a protection they
+ * bypass is not refused. Never written to a step output, for the reason above.
+ */
+function emitHeaderLines() {
+  const lines = [
+    ...parseHeaders(process.env.INPUT_APP_HEADERS),
+    ...parseHeaders(process.env.INPUT_APP_SECRET_HEADERS),
+  ];
+  if (lines.length > 0) {
+    process.stdout.write(`${lines.join('\n')}\n`);
+  }
+}
+
 function main() {
   if (process.argv.includes('--secret-header-args')) {
     emitSecretHeaderArgs();
+    return;
+  }
+  if (process.argv.includes('--header-lines')) {
+    emitHeaderLines();
     return;
   }
 
@@ -861,9 +905,11 @@ module.exports = {
   resolveCollectorUrl,
   parseHeaders,
   emitSecretHeaderArgs,
+  emitHeaderLines,
   resolveMode,
   resolveTarget,
   resolveRepoBinding,
+  resolveDiffBase,
   isNonRoutableHost,
   timeoutFloorMinutes,
   writeOutputs,

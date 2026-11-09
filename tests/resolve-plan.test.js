@@ -11,11 +11,13 @@ const {
   resolveMode,
   resolveTarget,
   resolveRepoBinding,
+  resolveDiffBase,
   isNonRoutableHost,
   timeoutFloorMinutes,
   writeOutputs,
   parseHeaders,
   emitSecretHeaderArgs,
+  emitHeaderLines,
   parseBoolean,
   resolveConsoleUrl,
   resolveCollectorUrl,
@@ -378,6 +380,61 @@ test('binding: turning it off declares no repository at all', () => {
     resolveRepoBinding({ bind: false, eventName: 'merge_request', prNumber: '42', sha: 'a'.repeat(40) }),
     ['--no-repo'],
   );
+});
+
+// ─── The local run's diff base ───────────────────────────────────────────────
+//
+// A local run's prompt names the base the agent diffs against. Measured as the
+// binding measures a push, or a push of several commits is read by its last.
+
+test('diff base: a push with a usable base diffs from it, over the parent', () => {
+  assert.equal(
+    resolveDiffBase({ eventName: 'push', beforeSha: 'b'.repeat(40), baseUsable: true, parentSha: 'c'.repeat(40) }),
+    'b'.repeat(40),
+  );
+});
+
+// Bitbucket names no base for a push, so run.sh hands over none.
+test('diff base: a push with no base, or one that is unusable or changes nothing, diffs from the parent', () => {
+  assert.equal(
+    resolveDiffBase({ eventName: 'push', beforeSha: '', baseUsable: false, parentSha: 'c'.repeat(40) }),
+    'c'.repeat(40),
+  );
+  assert.equal(
+    resolveDiffBase({ eventName: 'push', beforeSha: '0'.repeat(40), baseUsable: false, parentSha: 'c'.repeat(40) }),
+    'c'.repeat(40),
+  );
+  assert.equal(
+    resolveDiffBase({
+      eventName: 'push', beforeSha: 'b'.repeat(40), baseUsable: true, baseEmpty: true, parentSha: 'c'.repeat(40),
+    }),
+    'c'.repeat(40),
+  );
+  assert.equal(resolveDiffBase({ eventName: 'push', beforeSha: '', baseUsable: false, parentSha: '' }), '');
+});
+
+// A pull request diffs against its destination branch, and a manual or
+// scheduled run verifies the whole application.
+test('diff base: only a push has one', () => {
+  for (const eventName of ['merge_request', 'manual', 'schedule']) {
+    assert.equal(
+      resolveDiffBase({ eventName, beforeSha: 'b'.repeat(40), baseUsable: true, parentSha: 'c'.repeat(40) }),
+      '',
+      eventName,
+    );
+  }
+});
+
+test('diff base: the plan resolves it in either mode, from the strings run.sh hands over', () => {
+  const push = {
+    eventName: 'push', prNumber: '', beforeSha: '', baseUsable: 'false', baseEmpty: 'false', parentSha: 'c'.repeat(40),
+  };
+  assert.equal(resolvePlan(input(push)).diffBase, 'c'.repeat(40));
+  const local = resolvePlan(input({
+    ...push, verificationMode: 'local', anthropicApiKey: 'sk', appUrl: '', appStartCommand: 'npm start',
+  }));
+  assert.equal(local.ok, true, local.errors.join('; '));
+  assert.equal(local.diffBase, 'c'.repeat(40));
 });
 
 test('plan: bind_repository=false reaches the CLI', () => {
@@ -769,6 +826,37 @@ test('emitSecretHeaderArgs: one flag and value per configured header', () => {
   ]);
 });
 
+// The reachability check sends what the verification sends, plain and secret.
+test('emitHeaderLines: every configured header, one per line, plain then secret', () => {
+  const written = [];
+  const realWrite = process.stdout.write;
+  process.env.INPUT_APP_HEADERS = 'X-Plain: 1\n# a comment\n';
+  process.env.INPUT_APP_SECRET_HEADERS = 'X-Bypass: the-secret';
+  process.stdout.write = (chunk) => { written.push(String(chunk)); return true; };
+  try {
+    emitHeaderLines();
+  } finally {
+    process.stdout.write = realWrite;
+    delete process.env.INPUT_APP_HEADERS;
+    delete process.env.INPUT_APP_SECRET_HEADERS;
+  }
+
+  assert.equal(written.join(''), 'X-Plain: 1\nX-Bypass: the-secret\n');
+});
+
+test('emitHeaderLines: writes nothing when none are configured', () => {
+  const written = [];
+  const realWrite = process.stdout.write;
+  process.stdout.write = (chunk) => { written.push(String(chunk)); return true; };
+  try {
+    emitHeaderLines();
+  } finally {
+    process.stdout.write = realWrite;
+  }
+
+  assert.equal(written.join(''), '');
+});
+
 test('emitSecretHeaderArgs: writes nothing when none are configured', () => {
   const written = [];
   const realWrite = process.stdout.write;
@@ -1020,6 +1108,12 @@ test('outputs: target_host names where a tunnel target answers', () => {
 
   const deployed = resolvePlan(input());
   assert.match(writtenOutputs(deployed), /^target_host=$/m);
+});
+
+test('outputs: diff_base is the push\'s base, and empty for anything else', () => {
+  const push = resolvePlan(input({ eventName: 'push', prNumber: '', parentSha: 'c'.repeat(40) }));
+  assert.match(writtenOutputs(push), new RegExp(`^diff_base=${'c'.repeat(40)}$`, 'm'));
+  assert.match(writtenOutputs(resolvePlan(input())), /^diff_base=$/m);
 });
 
 test('outputs: cli_args is one argument per line in the delimiter form', () => {

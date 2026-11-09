@@ -134,6 +134,8 @@ Every other event — a manual pipeline, a schedule — goes straight to the par
 request binds by its id (`--pr`). The parent is read with `git cat-file commit` rather
 than `rev-parse <sha>^`, because a shallow checkout's graft makes git report the commit
 as parentless while the object still names it.
+A local run's prompt diffs a push against the same base (the plan's `diff_base`), and
+falls back to `HEAD~1`, then the empty tree, when this checkout does not have it.
 
 The service endpoints resolve as a set, not one at a time. `IRONBEE_COLLECTOR_URL`
 is the CLI's own stage-inference key, so the generated config **omits**

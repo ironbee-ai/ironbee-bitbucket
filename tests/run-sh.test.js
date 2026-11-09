@@ -137,6 +137,64 @@ test('inputs: taken out of the environment, kept in the shell', () => {
   assert.equal(printed, 'bb-secret|unset');
 });
 
+// ─── The restart before a re-verification ────────────────────────────────────
+
+// The process the pipe started, from a subshell that exits at once, so it is
+// nobody's child here and is gone the moment it is stopped.
+const START_OLD = '( sleep 30 >/dev/null 2>&1 & echo $! > .ironbee/app.pid ); OLD="$(cat .ironbee/app.pid)"';
+const OLD_STATE = 'if kill -0 "$OLD" 2>/dev/null; then echo old=up; kill "$OLD"; else echo old=stopped; fi';
+
+// What the start command serves is the build's output, so a restart that only
+// re-runs the start command serves the pre-fix build.
+test('restart: without a restart command the build runs again, then the start command replaces the process', () => {
+  const dir = tempDir();
+  const printed = bash(`
+    cd "${dir}"; mkdir -p .ironbee/artifacts
+    ${START_OLD}
+    APP_RESTART_COMMAND=''
+    APP_BUILD_COMMAND='echo build >> order'
+    APP_START_COMMAND='echo start >> order; exec sleep 30'
+    restart_app; echo "code=$?"
+    for i in 1 2 3 4 5 6 7 8 9 10; do grep -q start order 2>/dev/null && break; sleep 0.2; done
+    ${OLD_STATE}
+    NEW="$(cat .ironbee/app.pid)"
+    if [ "$NEW" != "$OLD" ] && kill -0 "$NEW" 2>/dev/null; then echo new=up; kill "$NEW"; fi
+    cat order
+  `);
+  const lines = printed.split('\n').filter((line) => !line.includes('Rebuilding the application'));
+  assert.equal(lines.join('\n'), 'code=0\nold=stopped\nnew=up\nbuild\nstart\n');
+});
+
+// Left running, the process the pipe started keeps the port and the old code.
+test('restart: a restart command runs once the process the pipe started is stopped, and owns the rebuild', () => {
+  const dir = tempDir();
+  const printed = bash(`
+    cd "${dir}"; mkdir -p .ironbee/artifacts
+    ${START_OLD}
+    APP_RESTART_COMMAND="if kill -0 $OLD 2>/dev/null; then echo old-still-up >> order; fi; echo restart >> order"
+    APP_BUILD_COMMAND='echo build >> order'
+    APP_START_COMMAND='echo start >> order'
+    restart_app; echo "code=$?"
+    ${OLD_STATE}
+    cat order
+  `);
+  assert.equal(printed, 'Restarting the application with APP_RESTART_COMMAND\ncode=0\nold=stopped\nrestart\n');
+});
+
+test('restart: a build that fails on the fixed code fails the restart, and starts nothing', () => {
+  const dir = tempDir();
+  const printed = bash(`
+    cd "${dir}"; mkdir -p .ironbee/artifacts
+    APP_RESTART_COMMAND=''
+    APP_BUILD_COMMAND='exit 3'
+    APP_START_COMMAND='echo start >> order'
+    restart_app; echo "code=$?"
+    sleep 0.5; [ -f order ] || echo nothing-started
+  `);
+  assert.match(printed, /ERROR:.*APP_BUILD_COMMAND failed on the fixed code/);
+  assert.match(printed, /code=1\nnothing-started\n$/);
+});
+
 // ─── The Bitbucket context ───────────────────────────────────────────────────
 
 // Bitbucket names no event. A pull request pipeline has its pull request, and

@@ -267,6 +267,14 @@ test('run.sh: neither outcome path ships a fix the re-verification rejected', ()
   }
 });
 
+// VERIFICATION_APPLY_FIX off lands nothing, in either mode: what the run
+// changed then is not a fix.
+test('run.sh: neither outcome path runs with fixing off', () => {
+  for (const id of ['commit-fixes', 'create-fix-pr']) {
+    assert.match(conditionOf(id), /\[ "\$PLAN_can_fix" = true \]/, id);
+  }
+});
+
 // The routing rule: on a pull request the fix lands on its branch; anywhere
 // else it opens a pull request.
 test('run.sh: a pull request lands its fixes on the branch, anything else opens a PR', () => {

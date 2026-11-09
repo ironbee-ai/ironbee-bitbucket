@@ -192,6 +192,64 @@ write_output_variables() {
   fi
 }
 
+# The restart before a re-verification. The running application is the
+# pre-fix code; replacing it is what makes the second run mean anything at
+# all — a re-verification against the old bytes reports a confident verdict
+# about code that no longer exists, in either direction: a good fix reads as
+# still broken, and a transient first failure reads as fixed.
+restart_app() {
+  local pid=''
+  if [ -f .ironbee/app.pid ]; then
+    pid="$(cat .ironbee/app.pid)"
+  fi
+
+  # The caller's own restart, run to completion so the application has been
+  # replaced before the run starts. The process this action started is
+  # stopped first while it is still up: left running, it keeps the port and
+  # the old code.
+  if [ -n "$APP_RESTART_COMMAND" ]; then
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      kill "$pid" 2>/dev/null || true
+      sleep 2
+    fi
+    echo "Restarting the application with APP_RESTART_COMMAND"
+    bash -c "$APP_RESTART_COMMAND" >> .ironbee/artifacts/app.log 2>&1 || {
+      annotate_error "APP_RESTART_COMMAND failed; the re-verification would run against the pre-fix application"
+      return 1
+    }
+    return 0
+  fi
+
+  # Whether this action's own restart can work at all. The process it
+  # started being gone already means the start command handed off —
+  # to docker compose, a process manager, a service — so the kill below
+  # hits nothing and re-running the command is a no-op against an
+  # application that is still up. Said out loud, because the symptom
+  # otherwise is a re-verification that quietly tested the wrong code.
+  if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
+    annotate_warning "the process this action started is no longer running, so APP_START_COMMAND hands the application off to something else"
+    annotate_warning "the restart before re-verification may not have replaced it, and the result may describe the pre-fix code"
+    annotate_warning "set APP_RESTART_COMMAND to the command that rebuilds and restarts it (for compose: docker compose up -d --build)"
+  fi
+  if [ -n "$pid" ]; then
+    kill "$pid" 2>/dev/null || true
+    sleep 2
+  fi
+  # The fix is in the sources, and what the start command serves is the
+  # build's output, so the build runs again first.
+  if [ -n "$APP_BUILD_COMMAND" ]; then
+    group_start "Rebuilding the application"
+    if ! bash -c "$APP_BUILD_COMMAND"; then
+      group_end
+      annotate_error "APP_BUILD_COMMAND failed on the fixed code, so there is no application to re-verify"
+      return 1
+    fi
+    group_end
+  fi
+  nohup bash -c "$APP_START_COMMAND" >> .ironbee/artifacts/app.log 2>&1 &
+  echo $! > .ironbee/app.pid
+}
+
 if [ "${BASH_SOURCE[0]}" != "$0" ]; then
   return 0
 fi
@@ -350,10 +408,20 @@ fi
 # Check the deployment is reachable
 step_check_deployment() {
   export APP_URL="$INPUT_APP_URL"
+  export INPUT_APP_HEADERS INPUT_APP_SECRET_HEADERS
+
+  # The headers the platform run sends go with the check, so a protection
+  # they bypass is not refused here. Read by curl through a descriptor, never
+  # a command line or a file: the secret ones are the caller's. A local run's
+  # agent sends none, and neither does its check.
+  HEADER_LINES=(true)
+  if [ "$PLAN_mode" = platform ]; then
+    HEADER_LINES=(node "$IRONBEE_BITBUCKET_HOME/scripts/resolve-plan.js" --header-lines)
+  fi
 
   # curl prints 000 itself when the connection fails, so nothing is appended to
   # it; an empty answer is a curl that could not run at all.
-  STATUS=$(curl -o /dev/null -s -w '%{http_code}' --max-time 15 -L "$APP_URL" || true)
+  STATUS=$(curl -o /dev/null -s -w '%{http_code}' --max-time 15 -L -H @<("${HEADER_LINES[@]}") "$APP_URL" || true)
   if [ -z "$STATUS" ]; then
     STATUS="000"
   fi
@@ -511,12 +579,18 @@ step_setup_ironbee() {
   export IRONBEE_API_KEY="$INPUT_IRONBEE_API_KEY"
 
   if [ "$PLAN_exclude_files" = "true" ]; then
-    echo ".mcp.json" >> .git/info/exclude
-    echo ".ironbee/" >> .git/info/exclude
-    echo ".claude/settings.json" >> .git/info/exclude
-    echo ".claude/skills/ironbee-*.md" >> .git/info/exclude
-    echo ".claude/rules/ironbee-*.md" >> .git/info/exclude
-    echo ".claude/commands/ironbee-*.md" >> .git/info/exclude
+    # Both asked of git: the exclude file is not .git/info/exclude from a
+    # working directory below the repository's root, and its patterns are
+    # read from the root, so each one names the working directory.
+    GIT_EXCLUDE="$(git rev-parse --git-path info/exclude)"
+    PREFIX="$(git rev-parse --show-prefix)"
+    mkdir -p "$(dirname "$GIT_EXCLUDE")"
+    echo "${PREFIX}.mcp.json" >> "$GIT_EXCLUDE"
+    echo "${PREFIX}.ironbee/" >> "$GIT_EXCLUDE"
+    echo "${PREFIX}.claude/settings.json" >> "$GIT_EXCLUDE"
+    echo "${PREFIX}.claude/skills/ironbee-*.md" >> "$GIT_EXCLUDE"
+    echo "${PREFIX}.claude/rules/ironbee-*.md" >> "$GIT_EXCLUDE"
+    echo "${PREFIX}.claude/commands/ironbee-*.md" >> "$GIT_EXCLUDE"
   fi
 
   ironbee install --client claude
@@ -572,7 +646,12 @@ step_build_prompt() {
     DIFF_TARGET="origin/${BITBUCKET_PR_DESTINATION_BRANCH}"
   elif [ "$EVENT_NAME" = "push" ]; then
     CONTEXT="Push to ${REF_NAME} (commit ${COMMIT_SHA})"
-    if git rev-parse HEAD~1 >/dev/null 2>&1; then
+    # The push's own base, the one the platform binding measures from: the
+    # last commit alone would leave the rest of a multi-commit push unread.
+    # Bitbucket names no base for a push, so on this host it is the parent.
+    if [ -n "$PLAN_diff_base" ] && git cat-file -e "${PLAN_diff_base}^{commit}" 2>/dev/null; then
+      DIFF_TARGET="$PLAN_diff_base"
+    elif git rev-parse HEAD~1 >/dev/null 2>&1; then
       DIFF_TARGET="HEAD~1"
     else
       DIFF_TARGET="$(git hash-object -t tree /dev/null)"
@@ -585,10 +664,20 @@ step_build_prompt() {
     CONTEXT="${EVENT_NAME} on ${REF_NAME}"
   fi
 
+  # With VERIFICATION_APPLY_FIX off the agent verifies and reports, and
+  # changes nothing: no fix lands from this run.
+  if [ "$PLAN_can_fix" = "true" ]; then
+    ON_FAILURE="If verification fails, fix the issues and re-verify"
+  else
+    ON_FAILURE="If verification fails, do not change any files: fixing is off for this run, and the verdict reports the issues"
+  fi
+
   # Build the prompt
   PROMPT=/tmp/ironbee-prompt.md
-  if [ -n "$DIFF_TARGET" ]; then
+  if [ -n "$DIFF_TARGET" ] && [ "$PLAN_can_fix" = "true" ]; then
     echo "You are running in CI. Verify the code changes and fix any issues found." > "$PROMPT"
+  elif [ -n "$DIFF_TARGET" ]; then
+    echo "You are running in CI. Verify the code changes and report any issues found." > "$PROMPT"
   else
     echo "You are running in CI. Verify that the application is working correctly." > "$PROMPT"
   fi
@@ -614,6 +703,10 @@ step_build_prompt() {
     fi
     if [ -n "$INPUT_APP_URL" ]; then
       echo "- Application URL: ${INPUT_APP_URL}" >> "$PROMPT"
+    fi
+    # The port the plan resolved: APP_PORT, or the one APP_URL names.
+    if [ -n "$PLAN_target_port" ]; then
+      echo "- Application port: ${PLAN_target_port}" >> "$PROMPT"
     fi
   fi
 
@@ -649,11 +742,11 @@ step_build_prompt() {
     echo "1. Review the code changes: \`git diff ${DIFF_TARGET} --name-only\` and \`git diff ${DIFF_TARGET}\`" >> "$PROMPT"
     echo "   IMPORTANT: Do NOT use \`git diff HEAD~1\`. Always use \`${DIFF_TARGET}\` as the diff target." >> "$PROMPT"
     echo "2. Run /ironbee-verify to perform verification" >> "$PROMPT"
-    echo "3. If verification fails, fix the issues and re-verify" >> "$PROMPT"
+    echo "3. ${ON_FAILURE}" >> "$PROMPT"
     echo "Do not commit, push, or open a pull request — that is handled for you." >> "$PROMPT"
   else
     echo "1. Run /ironbee-verify full to verify the application is working correctly" >> "$PROMPT"
-    echo "2. If verification fails, fix the issues and re-verify" >> "$PROMPT"
+    echo "2. ${ON_FAILURE}" >> "$PROMPT"
     echo "Do not commit, push, or open a pull request — that is handled for you." >> "$PROMPT"
   fi
 
@@ -1013,6 +1106,7 @@ step_platform_reverify() {
   export API_URL_OVERRIDE="$INPUT_IRONBEE_API_URL"
   export CLI_ARGS="$PLAN_cli_args"
   export INPUT_APP_SECRET_HEADERS
+  export APP_BUILD_COMMAND="$INPUT_APP_BUILD_COMMAND"
   export APP_START_COMMAND="$INPUT_APP_START_COMMAND"
   export APP_RESTART_COMMAND="$INPUT_APP_RESTART_COMMAND"
   # The restarted application reports to the same collector as the first
@@ -1024,36 +1118,8 @@ step_platform_reverify() {
     export IRONBEE_API_URL="$API_URL_OVERRIDE"
   fi
 
-  # The running application is the pre-fix code. Replacing it is what
-  # makes the second run mean anything at all — a re-verification against
-  # the old bytes reports a confident verdict about code that no longer
-  # exists, in either direction: a good fix reads as still broken, and a
-  # transient first failure reads as fixed.
-  if [ -n "$APP_RESTART_COMMAND" ]; then
-    echo "Restarting the application with APP_RESTART_COMMAND"
-    bash -c "$APP_RESTART_COMMAND" >> .ironbee/artifacts/app.log 2>&1 || {
-      annotate_error "APP_RESTART_COMMAND failed; the re-verification would run against the pre-fix application"
-      exit 1
-    }
-  else
-    # Whether this action's own restart can work at all. The process it
-    # started being gone already means the start command handed off —
-    # to docker compose, a process manager, a service — so the kill below
-    # hits nothing and re-running the command is a no-op against an
-    # application that is still up. Said out loud, because the symptom
-    # otherwise is a re-verification that quietly tested the wrong code.
-    if [ -f .ironbee/app.pid ] && ! kill -0 "$(cat .ironbee/app.pid)" 2>/dev/null; then
-      annotate_warning "the process this action started is no longer running, so APP_START_COMMAND hands the application off to something else"
-      annotate_warning "the restart before re-verification may not have replaced it, and the result may describe the pre-fix code"
-      annotate_warning "set APP_RESTART_COMMAND to the command that rebuilds and restarts it (for compose: docker compose up -d --build)"
-    fi
-    if [ -f .ironbee/app.pid ]; then
-      kill "$(cat .ironbee/app.pid)" 2>/dev/null || true
-      sleep 2
-    fi
-    nohup bash -c "$APP_START_COMMAND" >> .ironbee/artifacts/app.log 2>&1 &
-    echo $! > .ironbee/app.pid
-  fi
+  # The running application is the pre-fix code, and is replaced first.
+  restart_app
 
   ARGS=()
   while IFS= read -r line; do
@@ -1331,6 +1397,9 @@ fi
 # than opening a pull request they can ignore. Only `fail` blocks — an empty
 # verdict means no re-verification ran and `unknown` means one ran without
 # concluding, and neither is evidence against the fix.
+#
+# With fixing off nothing is committed: a file the run changed then — a
+# build's output, an agent that strayed from its prompt — is not a fix.
 
 # Commit the fixes to the pull request branch
 step_commit_fixes() {
@@ -1370,6 +1439,7 @@ step_commit_fixes() {
   echo "Pushed the fixes to ${HEAD_REF}"
 }
 if [ -n "$PLAN_mode" ] \
+  && [ "$PLAN_can_fix" = true ] \
   && [ "$EVENT_NAME" = merge_request ] \
   && [ "$IS_FORK" != true ] \
   && [ "$JOB_REVERIFIED_verdict" != fail ] \
@@ -1388,6 +1458,8 @@ fi
 # the same bytes), and `unknown` means one ran without reaching a verdict —
 # neither is evidence against the fix, and discarding it on either would
 # throw away good work over a missing signal.
+#
+# With fixing off nothing is opened, for the reason the push above gives.
 
 # Create fix PR
 step_create_fix_pr() {
@@ -1453,6 +1525,7 @@ step_create_fix_pr() {
   fi
 }
 if [ -n "$PLAN_mode" ] \
+  && [ "$PLAN_can_fix" = true ] \
   && [ "$EVENT_NAME" != merge_request ] \
   && [ "$JOB_REVERIFIED_verdict" != fail ] \
   && [ "$VERDICT_status" != fail ]; then

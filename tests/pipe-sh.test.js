@@ -249,3 +249,167 @@ test('pipe: the history is fetched from the repository URL into origin/<branch>'
   assert.equal(git(clone, 'rev-parse', '--is-shallow-repository'), 'false');
   assert.equal(git(clone, 'rev-parse', 'origin/main'), git(bare, 'rev-parse', 'main'));
 });
+
+// ─── The pipe, its tools stood in for ────────────────────────────────────────
+
+/**
+ * Stand-ins for what the pipe installs and calls. npm and npx install nothing;
+ * `ironbee install` writes the files the real one does; `claude` keeps its
+ * prompt in STUB_PROMPT, submits the verdict STUB_VERDICT names and, given
+ * STUB_EDIT, edits that file as a fix would; `curl` keeps its arguments and the
+ * headers it was handed, and answers 200 only with the header STUB_PASS names.
+ */
+function stubBin() {
+  const bin = tempDir();
+  const stub = (name, lines) => {
+    fs.writeFileSync(path.join(bin, name), `#!/usr/bin/env bash\n${lines.join('\n')}\n`, { mode: 0o755 });
+  };
+  stub('npm', ['if [ "$1" = view ]; then echo 0.0.0; fi']);
+  stub('npx', [':']);
+  stub('jq', ['cat >/dev/null']);
+  stub('ironbee', [
+    'case "$1" in',
+    '  --version) echo 0.0.0 ;;',
+    '  install) mkdir -p .claude && echo "{}" > .mcp.json && echo "{}" > .claude/settings.json ;;',
+    'esac',
+  ]);
+  stub('claude', [
+    'if [ "$1" = --version ]; then echo 0.0.0; exit 0; fi',
+    'cat > "$STUB_PROMPT"',
+    'mkdir -p .ironbee/sessions/s1',
+    'printf \'{"status":"%s"}\' "$STUB_VERDICT" > .ironbee/sessions/s1/verdict.json',
+    'if [ -n "${STUB_EDIT:-}" ]; then echo fixed >> "$STUB_EDIT"; fi',
+  ]);
+  stub('curl', [
+    'printf "%s\\n" "$*" > "$STUB_CURL_ARGS"',
+    ': > "$STUB_CURL_HEADERS"',
+    'while [ $# -gt 0 ]; do',
+    '  if [ "$1" = -H ]; then',
+    '    shift',
+    '    case "$1" in @*) cat "${1#@}" >> "$STUB_CURL_HEADERS" ;; *) echo "$1" >> "$STUB_CURL_HEADERS" ;; esac',
+    '  fi',
+    '  shift',
+    'done',
+    'if grep -qxF "$STUB_PASS" "$STUB_CURL_HEADERS"; then printf 200; else printf 403; fi',
+  ]);
+  return bin;
+}
+
+function commitFile(dir, file, content) {
+  fs.mkdirSync(path.dirname(path.join(dir, file)), { recursive: true });
+  fs.writeFileSync(path.join(dir, file), content);
+  execFileSync('git', ['add', '.'], { cwd: dir });
+  execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '-m', file], { cwd: dir });
+  return head(dir);
+}
+
+/** A local-mode push, with the agent's prompt as it was handed over. */
+function localPipe(dir, env) {
+  const prompt = path.join(tempDir(), 'prompt.md');
+  const result = runPipe(dir, {
+    PATH: `${stubBin()}${path.delimiter}${process.env.PATH}`,
+    VERIFICATION_MODE: 'local',
+    IRONBEE_API_KEY: 'ib-key',
+    ANTHROPIC_API_KEY: 'sk-test',
+    APP_START_COMMAND: 'npm start',
+    APP_PORT: '4000',
+    STUB_PROMPT: prompt,
+    STUB_VERDICT: 'pass',
+    ...env,
+  });
+  return { result, prompt: fs.existsSync(prompt) ? fs.readFileSync(prompt, 'utf8') : '' };
+}
+
+// Bitbucket names no base for a push: the prompt diffs from the base the
+// platform binding measures from, the commit's parent.
+test('pipe: a local push diffs from the base the binding measures from, and names the application\'s port', () => {
+  const dir = gitRepo();
+  commitFile(dir, 'a.txt', 'a\n');
+  const parent = head(dir);
+  commitFile(dir, 'b.txt', 'b\n');
+  const { result, prompt } = localPipe(dir, {});
+
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.match(prompt, new RegExp(`^Diff target: ${parent}$`, 'm'));
+  assert.match(prompt, /^- Application port: 4000$/m);
+});
+
+// Fixing off: the agent is not asked to fix, and what it changed anyway lands
+// nowhere.
+test('pipe: a local run with VERIFICATION_APPLY_FIX off asks for no fix and lands none', () => {
+  const dir = gitRepo();
+  const { result, prompt } = localPipe(dir, {
+    VERIFICATION_APPLY_FIX: 'false',
+    STUB_EDIT: path.join(dir, 'index.html'),
+  });
+
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.match(prompt, /^You are running in CI\. Verify the code changes and report any issues found\.$/m);
+  assert.match(prompt, /If verification fails, do not change any files/);
+  assert.doesNotMatch(prompt, /fix the issues/);
+  assert.doesNotMatch(result.stdout, /Create fix PR/);
+});
+
+test('pipe: a local run with VERIFICATION_APPLY_FIX on asks for the fix and lands it', () => {
+  const dir = gitRepo();
+  const { result, prompt } = localPipe(dir, { STUB_EDIT: path.join(dir, 'index.html') });
+
+  assert.match(prompt, /^3\. If verification fails, fix the issues and re-verify$/m);
+  // Landing it needs the step's token, which this run does not have.
+  assert.equal(result.status, 1);
+  assert.match(result.stdout, /there are fixes to open a pull request for, and no BITBUCKET_OAUTH_TOKEN/);
+});
+
+// The exclude file and its patterns are the repository's, read from its root.
+test('pipe: a working directory below the clone\'s root keeps the IronBee setup out of git', () => {
+  const dir = gitRepo();
+  commitFile(dir, 'web/index.html', '<h1>web</h1>\n');
+  const { result } = localPipe(dir, { WORKING_DIRECTORY: 'web' });
+
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  for (const file of ['web/.mcp.json', 'web/.claude/settings.json', 'web/.ironbee/config.json']) {
+    execFileSync('git', ['check-ignore', '-q', file], { cwd: dir });
+  }
+  assert.equal(execFileSync('git', ['status', '--porcelain'], { cwd: dir, encoding: 'utf8' }), '');
+});
+
+/** A run against a deployed URL that answers only with the bypass header. */
+function protectedDeployment(env) {
+  const scratch = tempDir();
+  const result = runPipe(gitRepo(), {
+    PATH: `${stubBin()}${path.delimiter}${process.env.PATH}`,
+    IRONBEE_API_KEY: 'ib-key',
+    APP_URL: 'https://preview.example.com',
+    APP_HEADERS: 'X-Plain: 1',
+    APP_SECRET_HEADERS: 'X-Bypass: s3cret',
+    STUB_PASS: 'X-Bypass: s3cret',
+    STUB_CURL_ARGS: path.join(scratch, 'args'),
+    STUB_CURL_HEADERS: path.join(scratch, 'headers'),
+    ...env,
+  });
+  return {
+    result,
+    args: fs.readFileSync(path.join(scratch, 'args'), 'utf8'),
+    headers: fs.readFileSync(path.join(scratch, 'headers'), 'utf8'),
+  };
+}
+
+// A protection the secret headers bypass is not refused, and the secret is
+// never on curl's command line.
+test('pipe: the reachability check sends the headers the platform run sends', () => {
+  const { result, args, headers } = protectedDeployment({ VERIFICATION_MODE: 'platform' });
+
+  assert.match(result.stdout, /https:\/\/preview\.example\.com answers 200/);
+  assert.doesNotMatch(result.stdout, /deployment protection/);
+  assert.equal(headers, 'X-Plain: 1\nX-Bypass: s3cret\n');
+  assert.doesNotMatch(args, /s3cret/);
+});
+
+// Local mode does not use the headers, so neither does its check.
+test('pipe: a local run\'s reachability check sends no headers', () => {
+  const { result, headers } = protectedDeployment({ VERIFICATION_MODE: 'local', ANTHROPIC_API_KEY: 'sk-test' });
+
+  assert.equal(result.status, 1);
+  assert.equal(headers, '');
+  assert.match(result.stdout, /ERROR:.*https:\/\/preview\.example\.com answers 403 — it is behind deployment protection/);
+});

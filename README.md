@@ -176,6 +176,8 @@ Without a token, the pipe still verifies: the report stays in the step log (with
 
 Fix commits carry `[skip ci]` in their message. Bitbucket starts a pipeline for every push, and without it the fix commit would verify itself, and fix itself, forever.
 
+So a fix pushed to a pull request's branch leaves its new head commit with no build at all. The merge check **Minimum number of successful builds for the last commit** (a branch restriction's merge settings) then blocks the merge until a pipeline runs on that commit: start one for the branch from **Pipelines → Run pipeline** once the fix has been reviewed.
+
 A pipe's variables reach everything the pipe starts. The pipe takes its own variables back out of the environment and hands each step only what the action handed it: the application you start gets no Anthropic key, and the agent no token.
 
 ## Starting the application in the pipe
@@ -244,7 +246,7 @@ A pipe cannot read its step's `max-time`, so the number is printed, not checked.
 
 ## Protected deployments
 
-A preview deployment behind SSO or a protection bypass answers 401 or 403 to the verification, and the run would report on the login page. The pipe refuses that case in preflight, by name.
+A preview deployment behind SSO or a protection bypass answers 401 or 403 to the verification, and the run would report on the login page. The pipe refuses that case in preflight, by name. The preflight request carries `APP_HEADERS` and `APP_SECRET_HEADERS` as the platform run does, so a protection they bypass passes it; local mode does not use them, so there a 401 or 403 is refused whatever they hold.
 
 An SSO redirect that answers **200** with a login page cannot be told apart from an application by a status code, so it is not caught — the verdict will describe the login page.
 
@@ -373,7 +375,7 @@ For any IronBee CLI setting not exposed as a dedicated variable, pass a JSON obj
 | `APP_START_COMMAND` | No | | Command to start the application. It runs with `IRONBEE_COLLECTOR_URL` and `IRONBEE_API_KEY` in its environment, the collector of this run's stage, for the application's own telemetry |
 | `APP_URL` | No | | Application URL for verification. A **routable** URL is verified as a deployment; a `localhost` one — or `host.docker.internal`, or a dotless host — means the application runs in this step and is reached through a reverse tunnel |
 | `APP_PORT` | No | | Local port the application listens on, for a tunnelled target. Required when `APP_START_COMMAND` is set without an `APP_URL`, or when `APP_URL` points at localhost without a port. No default — a guessed port tunnels to nothing. The port in `APP_URL` wins when both name one |
-| `APP_RESTART_COMMAND` | No | | Command that restarts the application so it picks up the fixes, run between the fix round and the re-verification. Empty stops the process this pipe started and re-runs `APP_START_COMMAND` — right only when that command runs the application itself. One that hands off (docker compose, a process manager) leaves the pre-fix code running, and the re-verification then reports a confident result about code that no longer exists. For a compose project: `docker compose up -d --build`. Like `APP_START_COMMAND`, it runs with `IRONBEE_COLLECTOR_URL` and `IRONBEE_API_KEY` in its environment |
+| `APP_RESTART_COMMAND` | No | | Command that restarts the application so it picks up the fixes, run between the fix round and the re-verification. Empty stops the process this pipe started, runs `APP_BUILD_COMMAND` again, and re-runs `APP_START_COMMAND` — right only when that command runs the application itself. One that hands off (docker compose, a process manager) leaves the pre-fix code running, and the re-verification then reports a confident result about code that no longer exists. For a compose project: `docker compose up -d --build`. Set, it runs after the process this pipe started is stopped (when that is still running), and to completion before the re-verification starts — so it returns once the application is restarting, as `up -d` does; one that stays in the foreground holds the step. Like `APP_START_COMMAND`, it runs with `IRONBEE_COLLECTOR_URL` and `IRONBEE_API_KEY` in its environment |
 | `APP_LOGS_COMMAND` | No | | Command that prints the application's own logs, captured into the evidence artifact. Needed whenever `APP_START_COMMAND` hands off — what the pipe captures then is lifecycle chatter, not the application, so a service that died or stopped consuming leaves no trace. For compose: `docker compose logs --no-color --tail=2000` |
 | `APP_WAIT_SECONDS` | No | | How long to wait for the local application to accept connections. Empty uses the CLI default (60s) |
 | `APP_HEADERS` | No | | Request headers for a deployed URL, one `Name: value` per line. **Non-secret values only** — they are stored in the clear and readable by anyone with any of the account's credentials |
