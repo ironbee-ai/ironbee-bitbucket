@@ -18,8 +18,9 @@
 const fs = require('fs');
 const path = require('path');
 
-// Shared by both report shapes, so a reader sees one product.
-const HEADER = '## <img src="https://ironbee.ai/favicon.png" width="24" height="24"> IronBee Verification Report';
+// Shared by both report shapes, so a reader sees one product. Plain Markdown:
+// Bitbucket shows raw HTML as text, and an image takes no size.
+const HEADER = '## ![IronBee](https://ironbee.ai/favicon.png) IronBee Verification Report';
 
 function main() {
   const argv = process.argv.slice(2);
@@ -78,7 +79,7 @@ function main() {
     lines.push('');
   });
 
-  // Collapsible session-end details — only when the session ended abnormally
+  // Session-end details — only when the session ended abnormally
   if (endReason && isAbnormalEnd(endReason)) {
     lines.push('---');
     lines.push('');
@@ -319,10 +320,11 @@ function formatEndBanner(end) {
   return `> ⚠️ **Session ended early:** ${label}${turns}. Verification may be incomplete.`;
 }
 
-// Collapsible <details> block with full end-of-session diagnostics.
+// Full end-of-session diagnostics under a bold heading: Bitbucket has no
+// collapsible block, and shows a `<details>` tag as text.
 function formatEndDetails(end) {
   const lines = [];
-  lines.push('<details><summary>Session end details</summary>');
+  lines.push('**Session end details**');
   lines.push('');
   lines.push(`- **Reason:** ${endReasonLabel(end)} (\`${end.subtype || 'unknown'}\`)`);
   if (end.terminal_reason && end.terminal_reason !== end.subtype) {
@@ -349,8 +351,6 @@ function formatEndDetails(end) {
       lines.push(`  - \`${d.tool_name}\`${target ? ` — ${target}` : ''}`);
     }
   }
-  lines.push('');
-  lines.push('</details>');
   return lines.join('\n');
 }
 

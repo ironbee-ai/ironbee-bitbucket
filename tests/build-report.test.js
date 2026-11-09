@@ -2,6 +2,10 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const { execFileSync } = require('node:child_process');
 
 const { buildPlatformReport, formatBadge, consoleHost, renderSummary } = require('../scripts/build-report.js');
 
@@ -114,6 +118,27 @@ test('the job id is in the footer when there is one', () => {
   const report = buildPlatformReport(job({ result: { status: 'pass' } }), OPTIONS);
 
   assert.match(report, /Job `job-1`/);
+});
+
+// Bitbucket shows raw HTML as text, so the report is Markdown alone: the icon
+// an image with no size, the session-end diagnostics under a bold heading.
+test('the platform report carries no HTML, and its header icon is a Markdown image', () => {
+  const report = buildPlatformReport(job({ result: { status: 'pass' } }), OPTIONS);
+  assert.match(report, /^## !\[IronBee\]\(https:\/\/ironbee\.ai\/favicon\.png\) IronBee Verification Report$/m);
+  assert.doesNotMatch(report, /<\/?[a-z][^>]*>/i);
+});
+
+test('the local report of a session that ended early carries no HTML', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'build-report-'));
+  fs.writeFileSync(path.join(dir, 'claude-output.log.raw'), `${JSON.stringify({
+    type: 'result', subtype: 'error_max_turns', num_turns: 100, session_id: 'sess-9',
+  })}\n`);
+  const report = execFileSync(process.execPath, [path.join(__dirname, '..', 'scripts', 'build-report.js'), dir, '1.0.0'], {
+    encoding: 'utf8',
+  });
+  assert.match(report, /^\*\*Session end details\*\*\n\n- \*\*Reason:\*\* Reached max turns limit/m);
+  assert.match(report, /^## !\[IronBee\]\(https:\/\/ironbee\.ai\/favicon\.png\) IronBee Verification Report$/m);
+  assert.doesNotMatch(report, /<\/?[a-z][^>]*>/i);
 });
 
 // The footer names the pipe a reader of the pull request can look up.
