@@ -420,7 +420,8 @@ function resolveRepoBinding({ eventName, prNumber, sha, beforeSha, baseUsable, b
  * The base a local run's prompt diffs a push against: the one the binding
  * above measures a push from, so the agent reviews every commit of the push
  * rather than its last one. Empty for any other event, or with no base at all.
- * Bitbucket names no base for a push, so this is the commit's parent.
+ * Bitbucket names no base for a push: run.sh passes where the push left its
+ * destination branch, and the commit's parent stands in when it cannot tell.
  */
 function resolveDiffBase({ eventName, beforeSha, baseUsable, baseEmpty, parentSha }) {
   if (eventName !== 'push') {

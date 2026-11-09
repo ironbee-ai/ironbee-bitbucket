@@ -3,7 +3,7 @@
 # scripts/run.sh). There is no `required` here; pipe.sh and resolve-plan.js
 # check what a run cannot do without.
 name: IronBee Verify
-image: ghcr.io/ironbee-ai/ironbee-bitbucket:v1.1.1
+image: ghcr.io/ironbee-ai/ironbee-bitbucket:v1.2.0
 category: Testing
 description: >-
   Verify code changes against the running application with IronBee, fix what

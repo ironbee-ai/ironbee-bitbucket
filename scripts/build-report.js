@@ -13,7 +13,9 @@
 //   [--job-url <url>] [--earlier-job-url <url>]
 //                                [--failure-code <c>] [--failure-message <m>]
 //
-// Outputs markdown to stdout.
+// Outputs markdown to stdout. One answer besides the report:
+//   node build-report.js --fix-cycle <dir>   `true` when <dir>/sessions holds a fix cycle
+//   node build-report.js --last-verdict <dir>   `<status>|<session id>` of the last verdict there
 
 const fs = require('fs');
 const path = require('path');
@@ -24,6 +26,16 @@ const HEADER = '## ![IronBee](https://ironbee.ai/favicon.png) IronBee Verificati
 
 function main() {
   const argv = process.argv.slice(2);
+  if (argv[0] === '--fix-cycle') {
+    console.log(hadFixCycle(parseVerdicts(argv[1] || '.')) ? 'true' : 'false');
+    return;
+  }
+  if (argv[0] === '--last-verdict') {
+    const cycles = parseVerdicts(argv[1] || '.');
+    const last = cycles[cycles.length - 1];
+    console.log(last ? `${last.verdict.status || 'unknown'}|${last.sessionId}` : '');
+    return;
+  }
   if (argv[0] === '--job') {
     console.log(buildPlatformReport(readJobFile(flag(argv, '--job')), {
       ironbeeVersion: flag(argv, '--version') || 'unknown',
@@ -240,29 +252,57 @@ function parseVerdicts(artifactsDir) {
 
   if (!fs.existsSync(sessionsDir)) return cycles;
 
-  for (const sessionId of fs.readdirSync(sessionsDir)) {
-    const actionsFile = path.join(sessionsDir, sessionId, 'actions.jsonl');
-    if (!fs.existsSync(actionsFile)) continue;
-
-    const lines = fs.readFileSync(actionsFile, 'utf-8').split('\n').filter(Boolean);
-    for (const line of lines) {
-      try {
-        const event = JSON.parse(line);
-        if (event.type === 'verdict_write' && event.verdict) {
-          cycles.push({
-            sessionId,
-            activityId: event.activity_id,
-            verificationId: event.verification_id,
-            verdict: event.verdict,
-          });
-        }
-      } catch {
-        // skip malformed lines
+  for (const sessionId of fs.readdirSync(sessionsDir).sort()) {
+    for (const event of readSessionEvents(path.join(sessionsDir, sessionId))) {
+      // A scenario run's verdict is for visibility only: it gates nothing, and
+      // its fail is no failure a fix answered.
+      if (event.type === 'verdict_write' && event.verdict && event.kind !== 'scenario') {
+        cycles.push({
+          sessionId,
+          activityId: event.activity_id,
+          verificationId: event.verification_id,
+          verdict: event.verdict,
+        });
       }
     }
   }
 
   return cycles;
+}
+
+// A session's events in order. Each agent writes its own
+// `agents/<id>/actions.jsonl`, and an older CLI wrote one `actions.jsonl` for
+// the session; they are merged by `timestamp`, each file's own order kept (a
+// line with an earlier or no timestamp stays after the one it followed).
+function readSessionEvents(sessionDir) {
+  const files = [path.join(sessionDir, 'actions.jsonl')];
+  const agentsDir = path.join(sessionDir, 'agents');
+  if (fs.existsSync(agentsDir)) {
+    for (const agentId of fs.readdirSync(agentsDir).sort()) {
+      files.push(path.join(agentsDir, agentId, 'actions.jsonl'));
+    }
+  }
+  const entries = [];
+  files.forEach((file, source) => {
+    if (!fs.existsSync(file)) {
+      return;
+    }
+    let key = Number.NEGATIVE_INFINITY;
+    fs.readFileSync(file, 'utf-8').split('\n').filter(Boolean).forEach((line, index) => {
+      let event;
+      try {
+        event = JSON.parse(line);
+      } catch {
+        // skip malformed lines
+        return;
+      }
+      const timestamp = typeof event.timestamp === 'number' ? event.timestamp : 0;
+      key = Math.max(key, timestamp);
+      entries.push({ event, key, source, index });
+    });
+  });
+  entries.sort((a, b) => (a.key - b.key) || (a.source - b.source) || (a.index - b.index));
+  return entries.map((entry) => entry.event);
 }
 
 // Normalize console URL into a bare hostname (strips scheme + trailing slashes).
@@ -409,7 +449,13 @@ function formatCycle(num, cycle, host) {
   return lines.join('\n');
 }
 
-module.exports = { buildPlatformReport, formatBadge, consoleHost, renderSummary };
+// A fix cycle: a failing verdict before the last one, so the agent fixed and
+// verified again. A run without one fixed nothing, whatever its tree gained.
+function hadFixCycle(cycles) {
+  return cycles.slice(0, -1).some((cycle) => cycle.verdict && cycle.verdict.status === 'fail');
+}
+
+module.exports = { buildPlatformReport, formatBadge, consoleHost, renderSummary, parseVerdicts, readSessionEvents, hadFixCycle };
 
 if (require.main === module) {
   main();

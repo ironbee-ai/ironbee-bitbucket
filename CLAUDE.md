@@ -49,7 +49,7 @@ A pipe is a **Docker image**, which Bitbucket runs as a container on the step's 
 
 1. **Packaging** — a pipe: a public image built from this repository, `pipe.yml` its metadata, `pipe.sh` its entry point. Everything that places it is the consumer's step: the step image, `size`, `services`, `max-time`, `auth`, `artifacts`, `caches`, a `deployment`.
 2. **Variables** — the action's inputs as upper-case variables (`VERIFICATION_MODE`, `IRONBEE_API_KEY`, `APP_START_COMMAND`, …), so every message names the variable the pipeline wrote. `pipe.yml` declares each with its default and `pipe.sh` applies it; a variable passed empty is empty, as a component input given an empty value is. The credentials default to the pipeline variables of their own names. `BITBUCKET_OAUTH_TOKEN` replaces `github_token`; `EVENT_NAME` is new; `verification_command` is gone, and so are GitLab's `stage`, `job_name` and `image` (the step's own keys).
-3. **Context** — Bitbucket names no event: `EVENT_NAME` defaults to `merge_request` when `BITBUCKET_PR_ID` is set and `push` otherwise, and a `custom:` or scheduled pipeline sets it to `manual` or `schedule`, which `resolve-plan.js` reads as GitLab's mapped pipeline source; `pipe.sh` refuses any other value. `BITBUCKET_COMMIT` is 12 characters on a pull request pipeline, so `pipe.sh` resolves it. Bitbucket has no push-before commit, so a push binds to its commit's parent. A fork's pull request runs no pipeline, so `IS_FORK` is `false`. Privacy is `BITBUCKET_REPO_IS_PRIVATE`. `IRONBEE_ENVIRONMENT` falls back to a deployment step's `BITBUCKET_DEPLOYMENT_ENVIRONMENT`. There is no title variable: the local prompt reads the pull request's title through `bitbucket-api.js pr-title`, and goes without it when that fails.
+3. **Context** — Bitbucket names no event: `EVENT_NAME` defaults to `merge_request` when `BITBUCKET_PR_ID` is set and `push` otherwise, and a `custom:` or scheduled pipeline sets it to `manual` or `schedule`, which `resolve-plan.js` reads as GitLab's mapped pipeline source; `pipe.sh` refuses any other value. `BITBUCKET_COMMIT` is 12 characters on a pull request pipeline, so `pipe.sh` resolves it. Bitbucket has no push-before commit, so a push binds to where it left its destination branch: the merge base of its commit with the pull request's destination (`BITBUCKET_PR_DESTINATION_BRANCH`), else with the repository's main branch (read by `git ls-remote --symref` in the fetch step), and the commit's parent when there is neither or the push is on that branch. A fork's pull request runs no pipeline, so `IS_FORK` is `false`. Privacy is `BITBUCKET_REPO_IS_PRIVATE`. `IRONBEE_ENVIRONMENT` falls back to a deployment step's `BITBUCKET_DEPLOYMENT_ENVIRONMENT`. There is no title variable: the local prompt reads the pull request's title through `bitbucket-api.js pr-title`, and goes without it when that fails.
 4. **Environment** — a pipe's variables reach every process it starts. `pipe.sh` moves each to `INPUT_<NAME>` and unsets it; `run.sh` un-exports the `INPUT_*` values (and the credentials' own names, should anything have left them), and each step exports what the action's `env:` did.
 5. **Git and tokens** — the clone's `origin` is the Pipelines proxy on the build container's loopback, which a pipe cannot reach, so every fetch and push goes to `REPOSITORY_URL` (`https://bitbucket.org/$BITBUCKET_REPO_FULL_NAME.git`). `pipe.sh` sets a global credential helper for `https://bitbucket.org` that answers `x-token-auth` and `$BITBUCKET_OAUTH_TOKEN` from the environment of the git it serves; the steps that fetch or push export the token from its input, and nothing else does, so the agent's git has none. The fetch uses `origin`'s refspec, so branches land at `origin/<branch>` as the action's fetch puts them. The clone is mounted from the build container, so it is a `safe.directory`; a pipe has no terminal, so `GIT_TERMINAL_PROMPT=0`. The `gh` calls are `bitbucket-api.js`: REST with `Bearer $BITBUCKET_OAUTH_TOKEN` at `api.bitbucket.org`. No token: the report stays in the log; fixes to push fail the step, naming `BITBUCKET_OAUTH_TOKEN`.
 6. **No comment command** — Bitbucket Pipelines has no trigger for a pull request comment: `parse-command.js`, the comment steps and the reactions are left out.
@@ -75,6 +75,8 @@ scripts/
                             #   failure_code / platform_publishes
   build-report.js           # report markdown, from artifacts (local) or a job body (platform)
   build-fix-prompt.js       # fix-only prompt built from a failing verdict
+  fix-paths.js              # the paths a fix touched: a tree snapshot before it, the diff
+                            #   after it, and the staging of those paths alone
   build-reverify-prompt.js  # the re-verification's prompt, with the fix round's account
   gate.js                   # whether the run passes
   annotations.js            # ERROR: / WARNING: / NOTICE: and headers, for Bitbucket
@@ -128,8 +130,9 @@ A variable added to the pipe goes in three places that a test holds equal: `pipe
 `INPUT_<NAME>` that `run.sh` or `resolve-plan.js` reads.
 
 The repository binding measures the changeset from the first base that says
-something: a push's own `before` when there is one (Bitbucket names none, so `BEFORE_SHA`
-is empty and the rule falls through), then the commit's first parent, then nothing.
+something: a push's own base (Bitbucket names none, so the plan step puts the merge base
+with the destination branch in `BEFORE_SHA`; on that branch itself it is the commit, an
+empty changeset, and the rule falls through), then the commit's first parent, then nothing.
 Every other event — a manual pipeline, a schedule — goes straight to the parent. A pull
 request binds by its id (`--pr`). The parent is read with `git cat-file commit` rather
 than `rev-parse <sha>^`, because a shallow checkout's graft makes git report the commit

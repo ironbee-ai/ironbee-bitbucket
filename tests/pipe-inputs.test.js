@@ -275,6 +275,107 @@ test('run.sh: neither outcome path runs with fixing off', () => {
   }
 });
 
+// What an install or a build left in the tree is not a fix: neither path runs
+// unless a fix step changed files, and then it stages only the paths it touched.
+test('run.sh: neither outcome path stages anything but what the fix touched', () => {
+  for (const id of ['commit-fixes', 'create-fix-pr']) {
+    assert.match(conditionOf(id), /\{ \[ "\$PLATFORM_FIX_fixed" = true \] \|\| \[ "\$CLAUDE_VERIFY_fixed" = true \]; \}/, id);
+  }
+  for (const fn of ['step_commit_fixes', 'step_create_fix_pr']) {
+    const body = stepBody(fn);
+    assert.doesNotMatch(body, /git add/, fn);
+    assert.match(body, /scripts\/fix-paths\.js" stage \.ironbee\/fix-paths/, fn);
+    assert.match(body, /git reset HEAD -- \.ironbee\//, fn);
+  }
+});
+
+// Each fix step measures its own changes from a snapshot taken before it.
+test('run.sh: both fix steps snapshot the tree before the fix and list what changed after it', () => {
+  for (const fn of ['step_claude_verify', 'step_platform_fix']) {
+    const body = stepBody(fn);
+    const snapshot = body.indexOf('fix-paths.js" snapshot .ironbee/pre-fix-tree');
+    const agent = body.indexOf('| claude --output-format');
+    const changed = body.indexOf('fix-paths.js" changed .ironbee/pre-fix-tree .ironbee/fix-paths');
+    assert.ok(snapshot !== -1 && snapshot < agent && agent < changed, fn);
+    assert.match(body, /echo "fixed=true" >> "\$IRONBEE_OUTPUT"/, fn);
+    assert.doesNotMatch(body, /git status --porcelain/, fn);
+  }
+});
+
+// The application this pipe started is started and stopped as a process group.
+test('run.sh: the application is started and stopped through the process-group helpers', () => {
+  assert.match(stepBody('step_start_app'), /\n\s+start_app_process(\n|$)/);
+  assert.match(stepBody('restart_app'), /\n\s+start_app_process(\n|$)/);
+  assert.match(stepBody('step_stop_app'), /stop_app_process "\$\(cat \.ironbee\/app\.pid\)"/);
+  // Neither the stop nor the default restart kills the process alone.
+  assert.doesNotMatch(stepBody('step_stop_app'), /^\s+kill [^\n]*app\.pid/m);
+  const restart = stepBody('restart_app');
+  assert.doesNotMatch(restart.slice(restart.indexOf('# Whether this action\'s own restart can work at all.')), /^\s+kill "\$pid"/m);
+  assert.equal((RUN_SH.match(/nohup bash -c "\$APP_START_COMMAND"/g) || []).length, 1);
+});
+
+// A push measures from where it left its destination branch, read in the plan
+// step from the branch the fetch step found.
+test('run.sh: a push binds to the merge base with its destination branch', () => {
+  const plan = stepBody('step_plan');
+  assert.ok(plan.includes('DESTINATION="${BITBUCKET_PR_DESTINATION_BRANCH:-$FETCH_HISTORY_main_branch}"'));
+  const base = plan.indexOf('BEFORE_SHA="$(bitbucket_push_base "$COMMIT_SHA" "$DESTINATION")"');
+  assert.notEqual(base, -1);
+  assert.ok(base < plan.indexOf('git cat-file -e "${BEFORE_SHA}^{commit}"'));
+  assert.match(stepBody('step_fetch_history'), /git ls-remote --symref "\$REPOSITORY_URL" HEAD/);
+  assert.match(stepBody('step_fetch_history'), /echo "main_branch=\$\{MAIN_BRANCH\}" >> "\$IRONBEE_OUTPUT"/);
+  // The depth only on a clone the unshallow left shallow: on a complete one it
+  // would cut the history the merge base is found in.
+  assert.match(
+    stepBody('step_fetch_history'),
+    /if \[ "\$\(git rev-parse --is-shallow-repository 2>\/dev\/null\)" = true \]; then\n\s+git fetch "\$REPOSITORY_URL" "\$refspec" --depth=50 2>\/dev\/null \|\| true\n\s+else\n\s+git fetch "\$REPOSITORY_URL" "\$refspec" 2>\/dev\/null \|\| true\n\s+fi/,
+  );
+});
+
+// From an emptied index, so what the agent staged itself stays out; and the
+// IronBee setup, written before the snapshot, only when the caller keeps it.
+test('run.sh: both outcome steps stage the fix from an emptied index, with the setup when it is kept', () => {
+  const body = stepBody;
+  for (const fn of ['step_commit_fixes', 'step_create_fix_pr']) {
+    const steps = body(fn);
+    assert.match(steps, /git reset -q \|\| true\n\s+node "\$IRONBEE_[A-Z]+_HOME\/scripts\/fix-paths\.js" stage \.ironbee\/fix-paths\n/, fn);
+    assert.match(steps, /if \[ "\$PLAN_exclude_files" != "true" \]; then\n\s+stage_setup_paths\n\s+fi/, fn);
+  }
+  assert.match(body('stage_setup_paths'), /for setup_path in \.mcp\.json \.gitignore \.claude; do/);
+});
+
+// Neither call may fail a step; a broken one leaves a list of nothing. In
+// local mode a changed tree is a fix only after a failing cycle.
+test('run.sh: the fix steps never fail on the snapshot, and a local fix needs a fix cycle', () => {
+  const body = stepBody;
+  for (const fn of ['step_claude_verify', 'step_platform_fix']) {
+    const steps = body(fn);
+    assert.match(steps, /fix-paths\.js" snapshot \.ironbee\/pre-fix-tree \|\| \{\n\s+annotate_warning "[^"]+"\n\s+: > \.ironbee\/pre-fix-tree\n\s+\}/, fn);
+    assert.match(steps, /fix-paths\.js" changed \.ironbee\/pre-fix-tree \.ironbee\/fix-paths \|\| \{\n\s+annotate_warning "[^"]+"\n\s+: > \.ironbee\/fix-paths\n\s+\}/, fn);
+  }
+  assert.match(body('step_claude_verify'), /FIX_CYCLE="\$\(node "\$IRONBEE_[A-Z]+_HOME\/scripts\/build-report\.js" --fix-cycle \.ironbee \|\| echo false\)"\n\s+if \[ -s \.ironbee\/fix-paths \] && \[ "\$FIX_CYCLE" = "true" \]; then/);
+});
+
+// The CLI keeps sessions outside the project by default, where nothing here
+// reads them: every local step that runs it keeps them in .ironbee/.
+test('run.sh: the local steps that run the CLI keep its sessions in the working directory', () => {
+  const body = stepBody;
+  for (const fn of ['step_setup_ironbee', 'step_claude_verify']) {
+    assert.match(body(fn), /\n\s+export IRONBEE_RUNTIME_LOCATION=in-project\n/, fn);
+  }
+  // The setup paths are added with an ignored one tolerated, never forced.
+  assert.match(body('stage_setup_paths'), /git add -A -- "\$setup_path" 2>\/dev\/null \|\| true/);
+  assert.doesNotMatch(body('stage_setup_paths'), /git add [^\n]*-f\b/);
+});
+
+// The trap is set as soon as the state directory is known, before any step.
+test('run.sh: the job traps the signals that end it, before the first step', () => {
+  const at = RUN_SH.indexOf('\nIRONBEE_STATE="$PWD/.ironbee"\ntrap_signals\n');
+  assert.notEqual(at, -1);
+  assert.ok(at < RUN_SH.indexOf('\n  run_step '));
+  assert.match(RUN_SH, /trap 'stop_on_signal 129' HUP\n\s+trap 'stop_on_signal 130' INT\n\s+trap 'stop_on_signal 143' TERM/);
+});
+
 // The routing rule: on a pull request the fix lands on its branch; anywhere
 // else it opens a pull request.
 test('run.sh: a pull request lands its fixes on the branch, anything else opens a PR', () => {
@@ -300,10 +401,10 @@ test('run.sh: every fix commit skips the pipelines its push would start', () => 
 // loopback, which a pipe cannot reach. Every fetch and push names the
 // repository's URL, and Bitbucket takes no push option.
 test('run.sh: every fetch and push goes to the repository URL, with no push option', () => {
-  const transfers = CODE_LINES.filter((line) => /\bgit (fetch|push)\b/.test(line));
-  assert.ok(transfers.length >= 4);
+  const transfers = CODE_LINES.filter((line) => /\bgit (fetch|push|ls-remote)\b/.test(line));
+  assert.ok(transfers.length >= 5);
   for (const line of transfers) {
-    assert.match(line, /\bgit (fetch|push)\b.*"\$REPOSITORY_URL"/, line.trim());
+    assert.match(line, /\bgit (fetch|push|ls-remote)\b.*"\$REPOSITORY_URL"/, line.trim());
     assert.doesNotMatch(line, /\borigin\b(?!\/)/, line.trim());
     assert.doesNotMatch(line, / -o /, line.trim());
   }

@@ -255,7 +255,10 @@ test('pipe: the history is fetched from the repository URL into origin/<branch>'
 /**
  * Stand-ins for what the pipe installs and calls. npm and npx install nothing;
  * `ironbee install` writes the files the real one does; `claude` keeps its
- * prompt in STUB_PROMPT, submits the verdict STUB_VERDICT names and, given
+ * prompt in STUB_PROMPT, writes its session as the CLI does (the main agent's
+ * `agents/main/` directory), submits the verdict STUB_VERDICT names (after
+ * those STUB_VERDICTS lists, when set), stages STUB_GIT_ADD as an agent might
+ * and, given
  * STUB_EDIT, edits that file as a fix would; `curl` keeps its arguments and the
  * headers it was handed, and answers 200 only with the header STUB_PASS names.
  */
@@ -276,8 +279,10 @@ function stubBin() {
   stub('claude', [
     'if [ "$1" = --version ]; then echo 0.0.0; exit 0; fi',
     'cat > "$STUB_PROMPT"',
-    'mkdir -p .ironbee/sessions/s1',
-    'printf \'{"status":"%s"}\' "$STUB_VERDICT" > .ironbee/sessions/s1/verdict.json',
+    'mkdir -p .ironbee/sessions/s1/agents/main',
+    'printf \'{"status":"%s"}\' "$STUB_VERDICT" > .ironbee/sessions/s1/agents/main/verdict.json',
+    'n=0; for status in ${STUB_VERDICTS:-$STUB_VERDICT}; do n=$((n + 1)); printf \'{"type":"verdict_write","timestamp":%s,"verdict":{"status":"%s"}}\\n\' "$n" "$status" >> .ironbee/sessions/s1/agents/main/actions.jsonl; done',
+    'if [ -n "${STUB_GIT_ADD:-}" ]; then git add -- "$STUB_GIT_ADD"; fi',
     'if [ -n "${STUB_EDIT:-}" ]; then echo fixed >> "$STUB_EDIT"; fi',
   ]);
   stub('curl', [
@@ -290,6 +295,7 @@ function stubBin() {
     '  fi',
     '  shift',
     'done',
+    'if [ -n "${STUB_REDIRECT:-}" ]; then printf "302 %s" "$STUB_REDIRECT"; exit 0; fi',
     'if grep -qxF "$STUB_PASS" "$STUB_CURL_HEADERS"; then printf 200; else printf 403; fi',
   ]);
   return bin;
@@ -304,7 +310,7 @@ function commitFile(dir, file, content) {
 }
 
 /** A local-mode push, with the agent's prompt as it was handed over. */
-function localPipe(dir, env) {
+function localPipe(dir, env, home) {
   const prompt = path.join(tempDir(), 'prompt.md');
   const result = runPipe(dir, {
     PATH: `${stubBin()}${path.delimiter}${process.env.PATH}`,
@@ -316,12 +322,91 @@ function localPipe(dir, env) {
     STUB_PROMPT: prompt,
     STUB_VERDICT: 'pass',
     ...env,
-  });
+  }, home);
   return { result, prompt: fs.existsSync(prompt) ? fs.readFileSync(prompt, 'utf8') : '' };
 }
 
-// Bitbucket names no base for a push: the prompt diffs from the base the
-// platform binding measures from, the commit's parent.
+/**
+ * The repository on "bitbucket.org", as a local bare one: `main` (its default
+ * branch) moved on after `feature` left it, by `mainAhead` more commits when
+ * set, and `feature` carries two commits.
+ * Returns a home whose git sends the repository's URL there.
+ */
+function upstreamWithFeature(mainAhead = 0) {
+  const upstream = gitRepo();
+  const git = (cwd, ...args) => execFileSync('git', args, { cwd, encoding: 'utf8' }).trim();
+  git(upstream, 'branch', '-M', 'main');
+  const forkPoint = commitFile(upstream, 'main-1.txt', 'm\n');
+  git(upstream, 'checkout', '-q', '-b', 'feature');
+  const featureParent = commitFile(upstream, 'feature-1.txt', 'f\n');
+  commitFile(upstream, 'feature-2.txt', 'f\n');
+  git(upstream, 'checkout', '-q', 'main');
+  const mainParent = forkPoint;
+  commitFile(upstream, 'main-2.txt', 'm\n');
+  if (mainAhead > 0) {
+    execFileSync('bash', ['-c', `for i in $(seq ${String(mainAhead)}); do git -c user.name=t -c user.email=t@t commit -q --allow-empty -m "main $i"; done`], { cwd: upstream });
+  }
+  const bare = path.join(tempDir(), 'shop.git');
+  git(upstream, 'clone', '-q', '--bare', upstream, bare);
+  const home = tempDir();
+  execFileSync('git', ['config', '--global', `url.file://${bare}.insteadOf`, 'https://bitbucket.org/ironbee/shop.git'], {
+    env: { ...baseEnv(home) },
+  });
+  const clone = (branch) => {
+    const dir = path.join(tempDir(), 'build');
+    execFileSync('git', ['clone', '-q', '--depth', '1', '--branch', branch, `file://${bare}`, dir]);
+    return dir;
+  };
+  return { home, clone, forkPoint, featureParent, mainParent };
+}
+
+// Bitbucket names no commit a push started from: a push of a branch measures
+// from where it left the repository's main branch, so every commit on it is read.
+test('pipe: a local push of a branch diffs from where it left the main branch', () => {
+  const { home, clone, forkPoint, featureParent } = upstreamWithFeature();
+  const { result, prompt } = localPipe(clone('feature'), { BITBUCKET_BRANCH: 'feature' }, home);
+
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.match(prompt, new RegExp(`^Diff target: ${forkPoint}$`, 'm'));
+  assert.doesNotMatch(prompt, new RegExp(featureParent));
+});
+
+// A depth of 50 after the unshallow made the clone shallow again, and a main
+// that moved further than that hid the merge base: the push then read only its
+// last commit, and said nothing.
+test('pipe: a branch whose main moved far ahead still diffs from where it left main', () => {
+  const { home, clone, forkPoint } = upstreamWithFeature(60);
+  const dir = clone('feature');
+  const { result, prompt } = localPipe(dir, { BITBUCKET_BRANCH: 'feature' }, home);
+
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.match(prompt, new RegExp(`^Diff target: ${forkPoint}$`, 'm'));
+  assert.equal(execFileSync('git', ['rev-parse', '--is-shallow-repository'], { cwd: dir, encoding: 'utf8' }).trim(), 'false');
+  assert.doesNotMatch(result.stdout, /measured from its commit's parent alone/);
+});
+
+// When the base cannot be found, a push off the main branch says it reads its
+// last commit alone.
+test('pipe: a branch push that falls back to the parent says so', () => {
+  const dir = gitRepo();
+  const { result } = localPipe(dir, { BITBUCKET_BRANCH: 'feature' });
+
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.match(result.stdout, /WARNING:.*the repository's main branch could not be read, so this push of feature is measured from its commit's parent alone/);
+});
+
+// On the main branch itself the merge base is the commit, a changeset of
+// nothing: the parent stands in.
+test('pipe: a local push to the main branch diffs from the commit\'s parent', () => {
+  const { home, clone, mainParent } = upstreamWithFeature();
+  const { result, prompt } = localPipe(clone('main'), { BITBUCKET_BRANCH: 'main' }, home);
+
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.match(prompt, new RegExp(`^Diff target: ${mainParent}$`, 'm'));
+});
+
+// The main branch unreadable — here, nothing answers at bitbucket.org — leaves
+// the parent, as before.
 test('pipe: a local push diffs from the base the binding measures from, and names the application\'s port', () => {
   const dir = gitRepo();
   commitFile(dir, 'a.txt', 'a\n');
@@ -352,12 +437,81 @@ test('pipe: a local run with VERIFICATION_APPLY_FIX off asks for no fix and land
 
 test('pipe: a local run with VERIFICATION_APPLY_FIX on asks for the fix and lands it', () => {
   const dir = gitRepo();
-  const { result, prompt } = localPipe(dir, { STUB_EDIT: path.join(dir, 'index.html') });
+  // Left by something before the agent ran: not the fix.
+  fs.writeFileSync(path.join(dir, 'build.log'), 'built\n');
+  // A failing cycle, the fix, and a passing one.
+  // The agent also staged that stray file itself: the emptied index drops it.
+  const { result, prompt } = localPipe(dir, { STUB_EDIT: path.join(dir, 'index.html'), STUB_VERDICTS: 'fail pass', STUB_GIT_ADD: 'build.log' });
 
   assert.match(prompt, /^3\. If verification fails, fix the issues and re-verify$/m);
   // Landing it needs the step's token, which this run does not have.
   assert.equal(result.status, 1);
   assert.match(result.stdout, /there are fixes to open a pull request for, and no BITBUCKET_OAUTH_TOKEN/);
+  // The commit on the fix branch carries the fix alone, not what was lying there.
+  const branch = execFileSync('git', ['branch', '--list', 'ironbee/fix-*', '--format=%(refname:short)'], { cwd: dir, encoding: 'utf8' }).trim();
+  const files = execFileSync('git', ['show', '--name-only', '--format=', branch], { cwd: dir, encoding: 'utf8' }).trim();
+  assert.equal(files, 'index.html');
+  // The session is s1, read from its agent's directory, and its evidence is kept whole.
+  assert.match(result.stdout, /\/sessions\/s1\)/);
+  assert.ok(fs.existsSync(path.join(dir, '.ironbee', 'upload', 'sessions', 's1', 'agents', 'main', 'actions.jsonl')));
+});
+
+// The agent installs, builds and starts the application in its own run: what
+// that wrote, on a run whose first cycle passed, is no fix.
+test('pipe: a local run whose first cycle passes over a changed tree lands nothing', () => {
+  const dir = gitRepo();
+  const { result } = localPipe(dir, { STUB_EDIT: path.join(dir, 'index.html') });
+
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.doesNotMatch(result.stdout, /Create fix PR/);
+  assert.equal(execFileSync('git', ['branch', '--list', 'ironbee/fix-*'], { cwd: dir, encoding: 'utf8' }), '');
+});
+
+// A setup path the repository ignores is skipped, as a whole-tree add skipped
+// it, and the fix still lands.
+test('pipe: a local run with IRONBEE_EXCLUDE_FILES off and an ignored .mcp.json still lands the fix', () => {
+  const dir = gitRepo();
+  commitFile(dir, '.gitignore', '.mcp.json\n');
+  const { result } = localPipe(dir, {
+    STUB_EDIT: path.join(dir, 'index.html'),
+    STUB_VERDICTS: 'fail pass',
+    IRONBEE_EXCLUDE_FILES: 'false',
+  });
+
+  assert.equal(result.status, 1);
+  assert.match(result.stdout, /there are fixes to open a pull request for, and no BITBUCKET_OAUTH_TOKEN/);
+  const branch = execFileSync('git', ['branch', '--list', 'ironbee/fix-*', '--format=%(refname:short)'], { cwd: dir, encoding: 'utf8' }).trim();
+  const files = execFileSync('git', ['show', '--name-only', '--format=', branch], { cwd: dir, encoding: 'utf8' }).trim();
+  assert.equal(files, '.claude/settings.json\nindex.html');
+});
+
+// With the IronBee setup kept in the commits, it lands with the fix, though
+// `ironbee install` wrote it before the snapshot.
+test('pipe: a local run with IRONBEE_EXCLUDE_FILES off lands the IronBee setup with the fix', () => {
+  const dir = gitRepo();
+  const { result } = localPipe(dir, {
+    STUB_EDIT: path.join(dir, 'index.html'),
+    STUB_VERDICTS: 'fail pass',
+    IRONBEE_EXCLUDE_FILES: 'false',
+  });
+
+  assert.equal(result.status, 1);
+  assert.match(result.stdout, /there are fixes to open a pull request for, and no BITBUCKET_OAUTH_TOKEN/);
+  const branch = execFileSync('git', ['branch', '--list', 'ironbee/fix-*', '--format=%(refname:short)'], { cwd: dir, encoding: 'utf8' }).trim();
+  const files = execFileSync('git', ['show', '--name-only', '--format=', branch], { cwd: dir, encoding: 'utf8' }).trim();
+  assert.equal(files, '.claude/settings.json\n.mcp.json\nindex.html');
+});
+
+// A run whose agent changed nothing stages nothing, whatever else is lying in
+// the tree.
+test('pipe: a local run whose agent changed nothing lands nothing', () => {
+  const dir = gitRepo();
+  fs.writeFileSync(path.join(dir, 'build.log'), 'built\n');
+  const { result } = localPipe(dir, {});
+
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.doesNotMatch(result.stdout, /Create fix PR/);
+  assert.equal(execFileSync('git', ['branch', '--list', 'ironbee/fix-*'], { cwd: dir, encoding: 'utf8' }), '');
 });
 
 // The exclude file and its patterns are the repository's, read from its root.
@@ -396,6 +550,16 @@ function protectedDeployment(env) {
 
 // A protection the secret headers bypass is not refused, and the secret is
 // never on curl's command line.
+// A redirect is not followed, so its target is named: a sign-in redirect to an
+// identity provider, or http to https, is then visible in the log.
+test('pipe: the reachability check names a redirect it does not follow', () => {
+  const { result, args } = protectedDeployment({ VERIFICATION_MODE: 'platform', STUB_REDIRECT: 'https://idp.example.com/login' });
+
+  assert.match(result.stdout, /WARNING:.*https:\/\/preview\.example\.com answers 302, redirecting to https:\/\/idp\.example\.com\/login\./);
+  assert.match(args, /%\{http_code\} %\{redirect_url\}/);
+  assert.doesNotMatch(args, /(^| )(-L|--location)( |$)/);
+});
+
 test('pipe: the reachability check sends the headers the platform run sends', () => {
   const { result, args, headers } = protectedDeployment({ VERIFICATION_MODE: 'platform' });
 
@@ -403,13 +567,16 @@ test('pipe: the reachability check sends the headers the platform run sends', ()
   assert.doesNotMatch(result.stdout, /deployment protection/);
   assert.equal(headers, 'X-Plain: 1\nX-Bypass: s3cret\n');
   assert.doesNotMatch(args, /s3cret/);
+  // A redirect would carry them to another host, so none is followed.
+  assert.doesNotMatch(args, /(^| )(-L|--location)( |$)/);
 });
 
 // Local mode does not use the headers, so neither does its check.
 test('pipe: a local run\'s reachability check sends no headers', () => {
-  const { result, headers } = protectedDeployment({ VERIFICATION_MODE: 'local', ANTHROPIC_API_KEY: 'sk-test' });
+  const { result, args, headers } = protectedDeployment({ VERIFICATION_MODE: 'local', ANTHROPIC_API_KEY: 'sk-test' });
 
   assert.equal(result.status, 1);
   assert.equal(headers, '');
   assert.match(result.stdout, /ERROR:.*https:\/\/preview\.example\.com answers 403 — it is behind deployment protection/);
+  assert.doesNotMatch(args, /(^| )(-L|--location)( |$)/);
 });

@@ -142,6 +142,14 @@ bitbucket_repository_private() {
   fi
 }
 
+# Where a push left its destination branch: the merge base of the commit and
+# that branch as the fetch put it. Empty when either is unknown here.
+bitbucket_push_base() {
+  if [ -n "$1" ] && [ -n "$2" ]; then
+    git merge-base "$1" "refs/remotes/origin/$2" 2>/dev/null || true
+  fi
+}
+
 # A step's page, whose Artifacts tab holds what the step's `artifacts:` kept.
 # The step's uuid carries braces, which a URL path escapes.
 bitbucket_step_url() {
@@ -192,6 +200,50 @@ write_output_variables() {
   fi
 }
 
+# The start command in the background, its log appended to. Job control is on
+# for this one command, so it leads a process group of its own and the restart
+# and the stop end it whole, children included. Stdin is /dev/null, as a
+# background command's is without job control.
+start_app_process() {
+  set -m
+  nohup bash -c "$APP_START_COMMAND" < /dev/null >> .ironbee/artifacts/app.log 2>&1 &
+  echo $! > .ironbee/app.pid
+  set +m
+}
+
+# The process group the start command leads, so what it spawned stops with
+# it; the process alone when it leads none.
+stop_app_process() {
+  kill -- "-$1" 2>/dev/null || kill "$1" 2>/dev/null || true
+}
+
+# A cancelled or timed-out job signals the job's process group, which the
+# application, leading its own, is not in: it is stopped here, so it does not
+# outlive the job holding the port. Nothing can be done on SIGKILL.
+stop_on_signal() {
+  if [ -f "$IRONBEE_STATE/app.pid" ]; then
+    stop_app_process "$(cat "$IRONBEE_STATE/app.pid")"
+  fi
+  exit "$1"
+}
+trap_signals() {
+  trap 'stop_on_signal 129' HUP
+  trap 'stop_on_signal 130' INT
+  trap 'stop_on_signal 143' TERM
+}
+
+# The IronBee setup `ironbee install` wrote, staged whole, for a caller who
+# keeps it in the commits. A path that neither exists nor is tracked is skipped,
+# and so is one the repository ignores, as a whole-tree add skips it.
+stage_setup_paths() {
+  local setup_path
+  for setup_path in .mcp.json .gitignore .claude; do
+    if [ -e "$setup_path" ] || [ -n "$(git ls-files -- "$setup_path")" ]; then
+      git add -A -- "$setup_path" 2>/dev/null || true
+    fi
+  done
+}
+
 # The restart before a re-verification. The running application is the
 # pre-fix code; replacing it is what makes the second run mean anything at
 # all — a re-verification against the old bytes reports a confident verdict
@@ -231,8 +283,9 @@ restart_app() {
     annotate_warning "the restart before re-verification may not have replaced it, and the result may describe the pre-fix code"
     annotate_warning "set APP_RESTART_COMMAND to the command that rebuilds and restarts it (for compose: docker compose up -d --build)"
   fi
+  # The whole process group, so nothing the start command spawned keeps the port.
   if [ -n "$pid" ]; then
-    kill "$pid" 2>/dev/null || true
+    stop_app_process "$pid"
     sleep 2
   fi
   # The fix is in the sources, and what the start command serves is the
@@ -246,8 +299,7 @@ restart_app() {
     fi
     group_end
   fi
-  nohup bash -c "$APP_START_COMMAND" >> .ironbee/artifacts/app.log 2>&1 &
-  echo $! > .ironbee/app.pid
+  start_app_process
 }
 
 if [ "${BASH_SOURCE[0]}" != "$0" ]; then
@@ -266,6 +318,7 @@ if ! cd "${INPUT_WORKING_DIRECTORY:-.}"; then
   exit 1
 fi
 IRONBEE_STATE="$PWD/.ironbee"
+trap_signals
 # The step's `artifacts:` keeps .ironbee/upload/, so it exists from the start.
 mkdir -p "$IRONBEE_STATE" "$IRONBEE_STATE/upload"
 
@@ -278,8 +331,8 @@ IS_FORK=false
 REPOSITORY_PRIVATE="$(bitbucket_repository_private "${BITBUCKET_REPO_IS_PRIVATE:-}")"
 PR_NUMBER="${BITBUCKET_PR_ID:-}"
 COMMIT_SHA="${BITBUCKET_COMMIT:-}"
-# Bitbucket names no commit a push started from, so a push measures from its
-# commit's parent.
+# Bitbucket names no commit a push started from; the plan step measures a push
+# from where it left its destination branch instead.
 BEFORE_SHA=""
 REF_NAME="${BITBUCKET_BRANCH:-${BITBUCKET_TAG:-}}"
 # Fetches and pushes go here, never to the clone's `origin`: that is the
@@ -326,7 +379,22 @@ step_fetch_history() {
 
   # Unshallow so git diff / git log always work (even single-commit repos)
   git fetch --unshallow "$REPOSITORY_URL" '+refs/heads/*:refs/remotes/origin/*' 2>/dev/null || true
-  git fetch "$REPOSITORY_URL" "$refspec" --depth=50 2>/dev/null || true
+  # A depth makes a complete history shallow again, and a merge base further
+  # back than it is then not found: the depth only where the unshallow did
+  # not take.
+  if [ "$(git rev-parse --is-shallow-repository 2>/dev/null)" = true ]; then
+    git fetch "$REPOSITORY_URL" "$refspec" --depth=50 2>/dev/null || true
+  else
+    git fetch "$REPOSITORY_URL" "$refspec" 2>/dev/null || true
+  fi
+
+  # The repository's main branch, the destination a push measures from when
+  # no pull request names one. Bitbucket hands a step no variable for it.
+  if [ "$EVENT_NAME" = push ] && [ -z "${BITBUCKET_PR_DESTINATION_BRANCH:-}" ]; then
+    MAIN_BRANCH="$(git ls-remote --symref "$REPOSITORY_URL" HEAD 2>/dev/null \
+      | awk '/^ref:/ { sub("^refs/heads/", "", $2); print $2; exit }')" || MAIN_BRANCH=""
+    echo "main_branch=${MAIN_BRANCH}" >> "$IRONBEE_OUTPUT"
+  fi
 }
 if success; then
   run_step fetch-history "Fetch git history for diff" step_fetch_history
@@ -364,6 +432,25 @@ step_plan() {
   export INPUT_IRONBEE_PYTHON_DEVTOOLS INPUT_IRONBEE_TERMINAL_DEVTOOLS
   export INPUT_IRONBEE_EXCLUDE_FILES INPUT_IRONBEE_EXTRA_CONFIG INPUT_VERBOSE
   export REPOSITORY_PRIVATE IS_FORK EVENT_NAME PR_NUMBER COMMIT_SHA BEFORE_SHA
+
+  # Bitbucket names no commit a push started from, so a push measures from
+  # where it left its destination branch: the pull request's when one is
+  # named, else the repository's main branch. On that branch itself the base
+  # is the commit, a changeset of nothing, and the parent stands in below.
+  if [ "$EVENT_NAME" = push ]; then
+    DESTINATION="${BITBUCKET_PR_DESTINATION_BRANCH:-$FETCH_HISTORY_main_branch}"
+    BEFORE_SHA="$(bitbucket_push_base "$COMMIT_SHA" "$DESTINATION")"
+    # Off the destination, the parent is the last commit alone and the rest of
+    # the branch goes unread, so that is said.
+    if [ -n "${BITBUCKET_BRANCH:-}" ] && [ "$BITBUCKET_BRANCH" != "$DESTINATION" ] \
+      && { [ -z "$BEFORE_SHA" ] || [ "$BEFORE_SHA" = "$COMMIT_SHA" ]; }; then
+      if [ -z "$DESTINATION" ]; then
+        annotate_warning "the repository's main branch could not be read, so this push of ${BITBUCKET_BRANCH} is measured from its commit's parent alone"
+      else
+        annotate_warning "${BITBUCKET_BRANCH} has no merge base with ${DESTINATION} below its own commit in this clone, so this push is measured from its commit's parent alone"
+      fi
+    fi
+  fi
 
   # The base of a push is a SHA this checkout may not have: the first push
   # of a branch reports all zeros, and a force-push can name a commit that
@@ -421,7 +508,15 @@ step_check_deployment() {
 
   # curl prints 000 itself when the connection fails, so nothing is appended to
   # it; an empty answer is a curl that could not run at all.
-  STATUS=$(curl -o /dev/null -s -w '%{http_code}' --max-time 15 -L -H @<("${HEADER_LINES[@]}") "$APP_URL" || true)
+  # Redirects are never followed, with headers or without: curl repeats
+  # custom headers to every host it is redirected to, and these carry
+  # secrets. The target is named instead, below.
+  ANSWER=$(curl -o /dev/null -s -w '%{http_code} %{redirect_url}' --max-time 15 -H @<("${HEADER_LINES[@]}") "$APP_URL" || true)
+  STATUS="${ANSWER%% *}"
+  REDIRECT=""
+  if [ "$STATUS" != "$ANSWER" ]; then
+    REDIRECT="${ANSWER#* }"
+  fi
   if [ -z "$STATUS" ]; then
     STATUS="000"
   fi
@@ -438,6 +533,10 @@ step_check_deployment() {
   # nothing about whether the run can reach it.
   if [ "$STATUS" = "000" ]; then
     annotate_warning "$APP_URL did not answer from this runner. The verification runs from elsewhere and may still reach it."
+  elif [ "${STATUS#3}" != "$STATUS" ]; then
+    # A sign-in redirect to an identity provider, or http to https: the
+    # verification follows it, and reports on wherever it lands.
+    annotate_warning "$APP_URL answers $STATUS, redirecting to ${REDIRECT:-a target it does not name}. Not followed here; if that is a sign-in page, the verification will report on it rather than on the application."
   else
     echo "$APP_URL answers $STATUS"
   fi
@@ -577,6 +676,10 @@ fi
 # Setup IronBee for Claude
 step_setup_ironbee() {
   export IRONBEE_API_KEY="$INPUT_IRONBEE_API_KEY"
+  # The sessions in .ironbee/ under the working directory, where the verdict,
+  # the evidence and the fix detection read them; the CLI's default keeps them
+  # outside the project.
+  export IRONBEE_RUNTIME_LOCATION=in-project
 
   if [ "$PLAN_exclude_files" = "true" ]; then
     # Both asked of git: the exclude file is not .git/info/exclude from a
@@ -838,9 +941,10 @@ step_start_app() {
 
   # Both streams to one file, because "the app never started" and "the app
   # answered 500" are the two failures a reader has to tell apart and the
-  # verdict shows neither.
-  nohup bash -c "$APP_START_COMMAND" > .ironbee/artifacts/app.log 2>&1 &
-  echo $! > .ironbee/app.pid
+  # verdict shows neither. In a process group of its own, so the restart and
+  # the stop end it whole.
+  : > .ironbee/artifacts/app.log
+  start_app_process
   echo "Started the application (pid $(cat .ironbee/app.pid)); waiting for it happens in the CLI"
 
   # An application published on another host — the step's Docker service,
@@ -947,6 +1051,8 @@ step_claude_verify() {
   export CLAUDE_CODE_OAUTH_TOKEN="$INPUT_CLAUDE_CODE_OAUTH_TOKEN"
   export IRONBEE_API_KEY="$INPUT_IRONBEE_API_KEY"
   export PROMPT_CONTENT="$BUILD_PROMPT_prompt"
+  # Its hooks write the session in .ironbee/, as above.
+  export IRONBEE_RUNTIME_LOCATION=in-project
   # Claude Code refuses --dangerously-skip-permissions as root unless told it
   # is in a sandbox. The pipe's image runs as root, where GitHub's runner
   # does not, and the pipe's container is that sandbox.
@@ -964,6 +1070,14 @@ step_claude_verify() {
   # Split as shell words, as the action's expression splice is, so a quoted
   # argument stays one argument.
   eval "EXTRA_ARGS=( $INPUT_CLAUDE_CODE_ARGS )"
+
+  # The tree before the agent runs. It verifies and fixes in this one
+  # invocation, so what changed after this is its fix, and what the IronBee
+  # setup or anything earlier left in the tree is not.
+  node "$IRONBEE_BITBUCKET_HOME/scripts/fix-paths.js" snapshot .ironbee/pre-fix-tree || {
+    annotate_warning "the tree before the fix could not be recorded; what changed is read from git status"
+    : > .ironbee/pre-fix-tree
+  }
 
   cat "$PROMPT_FILE" | claude --output-format stream-json --verbose \
     --max-turns $INPUT_CLAUDE_CODE_MAX_TURNS \
@@ -989,6 +1103,20 @@ step_claude_verify() {
     ' 2>/dev/null | tee "$LOG_FILE" || true
 
   rm -f "$PROMPT_FILE"
+
+  node "$IRONBEE_BITBUCKET_HOME/scripts/fix-paths.js" changed .ironbee/pre-fix-tree .ironbee/fix-paths || {
+    annotate_warning "what the fix changed could not be read; no path counts as fixed"
+    : > .ironbee/fix-paths
+  }
+  # A fix needs a fix cycle too: a failing verdict before the last one. The
+  # agent installs, builds and starts the application in this same run, and
+  # what those wrote is no fix on a run that never failed.
+  FIX_CYCLE="$(node "$IRONBEE_BITBUCKET_HOME/scripts/build-report.js" --fix-cycle .ironbee || echo false)"
+  if [ -s .ironbee/fix-paths ] && [ "$FIX_CYCLE" = "true" ]; then
+    echo "fixed=true" >> "$IRONBEE_OUTPUT"
+  else
+    echo "fixed=false" >> "$IRONBEE_OUTPUT"
+  fi
 }
 if success && [ "$PLAN_mode" = local ]; then
   run_step claude-verify "Run Claude Code verification" step_claude_verify
@@ -1049,6 +1177,13 @@ step_platform_fix() {
     exit 1
   fi
 
+  # The tree before the fix: what the install and the build left in it is
+  # not the fix.
+  node "$IRONBEE_BITBUCKET_HOME/scripts/fix-paths.js" snapshot .ironbee/pre-fix-tree || {
+    annotate_warning "the tree before the fix could not be recorded; what changed is read from git status"
+    : > .ironbee/pre-fix-tree
+  }
+
   group_start "Fixing the reported issues"
   cat "$PROMPT_FILE" | claude --output-format stream-json --verbose \
     --max-turns 60 \
@@ -1066,11 +1201,15 @@ step_platform_fix() {
     ' 2>/dev/null || true
   group_end
 
-  # `.ironbee` is excluded because this action writes into it — the job
-  # body, the prompts, the logs. Counting those as "the agent changed
-  # something" would report a fix on every run that produced none, and
-  # then re-verify against unchanged code.
-  if [ -n "$(git status --porcelain -- ':(exclude).ironbee')" ]; then
+  # Only what changed since the snapshot, and `.ironbee` never: this action
+  # writes into it — the job body, the prompts, the logs. Counting those, or
+  # a build's output, as "the agent changed something" would report a fix
+  # on a run that produced none, and then re-verify against unchanged code.
+  node "$IRONBEE_BITBUCKET_HOME/scripts/fix-paths.js" changed .ironbee/pre-fix-tree .ironbee/fix-paths || {
+    annotate_warning "what the fix changed could not be read; no path counts as fixed"
+    : > .ironbee/fix-paths
+  }
+  if [ -s .ironbee/fix-paths ]; then
     # The agent's own account of the fixes, for the re-verification's
     # prompt. The final result event carries its closing message, which is
     # the summary the fix prompt asks for — every other assistant turn is
@@ -1193,7 +1332,10 @@ step_extract_verdict() {
   VERDICT_FILE=$(find .ironbee/sessions -name "verdict.json" -type f 2>/dev/null | xargs -r ls -t 2>/dev/null | head -1)
   if [ -n "$VERDICT_FILE" ] && [ -f "$VERDICT_FILE" ]; then
     STATUS=$(node -e "const v=JSON.parse(require('fs').readFileSync('$VERDICT_FILE','utf8'));console.log(v.status||'unknown')" 2>/dev/null || echo "unknown")
-    SESSION_ID=$(basename "$(dirname "$VERDICT_FILE")")
+    # The session is the directory under sessions/: the verdict sits in it,
+    # or in its owning agent's directory below it.
+    SESSION_PATH="${VERDICT_FILE#.ironbee/sessions/}"
+    SESSION_ID="${SESSION_PATH%%/*}"
     if [ "$PLAN_verbose" = "true" ]; then
       group_start "Verdict details"
       cat "$VERDICT_FILE" | node -e "process.stdin.on('data',d=>console.log(JSON.stringify(JSON.parse(d),null,2)))" 2>/dev/null || cat "$VERDICT_FILE"
@@ -1201,25 +1343,13 @@ step_extract_verdict() {
     fi
   fi
 
-  # Fallback: derive status/session_id from the latest verdict_write event in actions.jsonl
+  # Fallback: derive status/session_id from the latest verdict_write event,
+  # read across every agent's actions.jsonl as the report reads them
   if [ -z "$SESSION_ID" ] || [ "$STATUS" = "unknown" ]; then
-    ACTIONS_FILE=$(find .ironbee/sessions -name "actions.jsonl" -type f 2>/dev/null | xargs -r ls -t 2>/dev/null | head -1)
-    if [ -n "$ACTIONS_FILE" ] && [ -f "$ACTIONS_FILE" ]; then
-      EXTRACTED=$(ACTIONS_FILE="$ACTIONS_FILE" node -e "
-        const lines=require('fs').readFileSync(process.env.ACTIONS_FILE,'utf8').split('\n').filter(Boolean);
-        for (let i=lines.length-1;i>=0;i--) {
-          try { const e=JSON.parse(lines[i]);
-            if (e.type==='verdict_write' && e.verdict) {
-              console.log((e.verdict.status||'unknown')+'|'+(e.session_id||''));
-              return;
-            }
-          } catch {}
-        }
-      " 2>/dev/null || echo "")
-      if [ -n "$EXTRACTED" ]; then
-        [ "$STATUS" = "unknown" ] && STATUS="${EXTRACTED%%|*}"
-        [ -z "$SESSION_ID" ] && SESSION_ID="${EXTRACTED##*|}"
-      fi
+    EXTRACTED=$(node "$IRONBEE_BITBUCKET_HOME/scripts/build-report.js" --last-verdict .ironbee 2>/dev/null || echo "")
+    if [ -n "$EXTRACTED" ]; then
+      [ "$STATUS" = "unknown" ] && STATUS="${EXTRACTED%%|*}"
+      [ -z "$SESSION_ID" ] && SESSION_ID="${EXTRACTED##*|}"
     fi
   fi
 
@@ -1253,13 +1383,13 @@ step_collect() {
   ARTIFACTS_DIR=".ironbee/artifacts"
   HAS_ARTIFACTS=false
 
-  # Copy session logs to artifacts
+  # Copy each session to artifacts whole: its verdicts and actions sit in
+  # its agents' directories
   for session_dir in .ironbee/sessions/*/; do
     if [ -d "$session_dir" ]; then
       SESSION_ID=$(basename "$session_dir")
       mkdir -p "$ARTIFACTS_DIR/sessions/$SESSION_ID"
-      cp -f "$session_dir"verdict.json "$ARTIFACTS_DIR/sessions/$SESSION_ID/" 2>/dev/null || true
-      cp -f "$session_dir"actions.jsonl "$ARTIFACTS_DIR/sessions/$SESSION_ID/" 2>/dev/null || true
+      cp -R "$session_dir". "$ARTIFACTS_DIR/sessions/$SESSION_ID/" 2>/dev/null || true
       HAS_ARTIFACTS=true
     fi
   done
@@ -1406,7 +1536,16 @@ step_commit_fixes() {
   export HEAD_REF="$BITBUCKET_BRANCH"
   export BITBUCKET_OAUTH_TOKEN="$INPUT_BITBUCKET_OAUTH_TOKEN"
 
-  git add -A
+  # The paths the fix touched and nothing else: what an install or a build
+  # left in the tree is not a fix. The index is emptied first, so nothing
+  # the agent staged itself comes along.
+  git reset -q || true
+  node "$IRONBEE_BITBUCKET_HOME/scripts/fix-paths.js" stage .ironbee/fix-paths
+  # The IronBee setup was written before the snapshot, so it is never among
+  # those paths: a caller who keeps it in the commits has it staged here.
+  if [ "$PLAN_exclude_files" != "true" ]; then
+    stage_setup_paths
+  fi
   # Always unstaged: this action's own working files. The rest only when
   # the caller asked for the IronBee setup to stay out of their commits.
   git reset HEAD -- .ironbee/ 2>/dev/null || true
@@ -1440,6 +1579,7 @@ step_commit_fixes() {
 }
 if [ -n "$PLAN_mode" ] \
   && [ "$PLAN_can_fix" = true ] \
+  && { [ "$PLATFORM_FIX_fixed" = true ] || [ "$CLAUDE_VERIFY_fixed" = true ]; } \
   && [ "$EVENT_NAME" = merge_request ] \
   && [ "$IS_FORK" != true ] \
   && [ "$JOB_REVERIFIED_verdict" != fail ] \
@@ -1481,7 +1621,13 @@ step_create_fix_pr() {
   SHORT_SHA=$(echo "$ORIGINAL_SHA" | cut -c1-7)
   BRANCH="ironbee/fix-${SHORT_SHA}-${BITBUCKET_BUILD_NUMBER}"
 
-  git add -A
+  # Only the paths the fix touched, and the IronBee setup when the caller
+  # keeps it, from an emptied index, as on a pull request.
+  git reset -q || true
+  node "$IRONBEE_BITBUCKET_HOME/scripts/fix-paths.js" stage .ironbee/fix-paths
+  if [ "$PLAN_exclude_files" != "true" ]; then
+    stage_setup_paths
+  fi
   if [ "$PLAN_exclude_files" = "true" ]; then
     git reset HEAD -- .mcp.json .gitignore .claude/ 2>/dev/null || true
   fi
@@ -1526,6 +1672,7 @@ step_create_fix_pr() {
 }
 if [ -n "$PLAN_mode" ] \
   && [ "$PLAN_can_fix" = true ] \
+  && { [ "$PLATFORM_FIX_fixed" = true ] || [ "$CLAUDE_VERIFY_fixed" = true ]; } \
   && [ "$EVENT_NAME" != merge_request ] \
   && [ "$JOB_REVERIFIED_verdict" != fail ] \
   && [ "$VERDICT_status" != fail ]; then
@@ -1553,8 +1700,9 @@ fi
 
 # Stop the application
 step_stop_app() {
+  # The whole process group, as the restart stops it.
   if [ -f .ironbee/app.pid ]; then
-    kill "$(cat .ironbee/app.pid)" 2>/dev/null || true
+    stop_app_process "$(cat .ironbee/app.pid)"
     rm -f .ironbee/app.pid
   fi
   if [ -f .ironbee/forward-port.pid ]; then

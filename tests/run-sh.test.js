@@ -5,7 +5,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { execFileSync } = require('node:child_process');
+const { execFileSync, spawnSync } = require('node:child_process');
 
 // run.sh is the action's steps as one bash script. Sourcing it defines its
 // helpers and stops, so the translation of GitHub's machinery — step outputs,
@@ -181,6 +181,83 @@ test('restart: a restart command runs once the process the pipe started is stopp
   assert.equal(printed, 'Restarting the application with APP_RESTART_COMMAND\ncode=0\nold=stopped\nrestart\n');
 });
 
+// The start command's children would otherwise outlive the restart, keep the
+// port, and serve the pre-fix code to the re-verification.
+test('restart: the process group the pipe started stops whole, and the new one leads its own', () => {
+  const dir = tempDir();
+  const printed = bash(`
+    cd "${dir}"; mkdir -p .ironbee/artifacts
+    ( set -m; nohup bash -c 'sleep 30 & echo $! > child.pid; wait' < /dev/null > /dev/null 2>&1 & echo $! > .ironbee/app.pid )
+    for i in 1 2 3 4 5 6 7 8 9 10; do [ -s child.pid ] && break; sleep 0.2; done
+    CHILD="$(cat child.pid)"; [ -n "$CHILD" ] || exit 9
+    APP_RESTART_COMMAND=''
+    APP_BUILD_COMMAND=''
+    APP_START_COMMAND='exec sleep 30'
+    restart_app >/dev/null; echo "code=$?"
+    sleep 0.5
+    if kill -0 "$CHILD" 2>/dev/null; then echo child=up; kill "$CHILD"; else echo child=stopped; fi
+    NEW="$(cat .ironbee/app.pid)"
+    if [ "$(ps -o pgid= -p "$NEW" | tr -d ' ')" = "$NEW" ]; then echo new=own-group; fi
+    stop_app_process "$NEW"
+  `);
+  assert.equal(printed, 'code=0\nchild=stopped\nnew=own-group\n');
+});
+
+test('stop: the application started by command stops whole, what it spawned included', () => {
+  const dir = tempDir();
+  const printed = bash(`
+    cd "${dir}"; mkdir -p .ironbee/artifacts
+    APP_START_COMMAND='echo started; sleep 30 & echo $! > child.pid; wait'
+    ( set -eo pipefail; start_app_process )
+    for i in 1 2 3 4 5 6 7 8 9 10; do [ -s child.pid ] && break; sleep 0.2; done
+    APP="$(cat .ironbee/app.pid)"; CHILD="$(cat child.pid)"
+    [ -n "$APP" ] && [ -n "$CHILD" ] || exit 9
+    if [ "$(ps -o pgid= -p "$APP" | tr -d ' ')" = "$APP" ]; then echo app=own-group; fi
+    stop_app_process "$APP"
+    sleep 0.5
+    if kill -0 "$CHILD" 2>/dev/null; then echo child=up; kill "$CHILD"; else echo child=stopped; fi
+    cat .ironbee/artifacts/app.log
+  `);
+  assert.equal(printed, 'app=own-group\nchild=stopped\nstarted\n');
+});
+
+// The application leads its own process group, out of reach of the signal a
+// cancelled job sends the job's: the job's trap stops it, then ends the job.
+test('signals: a cancelled job stops the application it started, its group whole', () => {
+  const dir = tempDir();
+  const result = spawnSync('bash', ['-c', `
+    source "${RUN_SH}"
+    cd "${dir}"; mkdir -p .ironbee/artifacts; IRONBEE_STATE="$PWD/.ironbee"
+    APP_START_COMMAND='sleep 30 & echo $! > child.pid; wait'
+    start_app_process
+    for i in 1 2 3 4 5 6 7 8 9 10; do [ -s child.pid ] && break; sleep 0.2; done
+    [ -s child.pid ] || exit 9
+    trap_signals
+    kill -TERM $$
+    echo not-reached
+  `], { encoding: 'utf8', env: { PATH: process.env.PATH } });
+
+  assert.equal(result.status, 143, result.stdout + result.stderr);
+  assert.doesNotMatch(result.stdout, /not-reached/);
+  const alive = (pid) => spawnSync('kill', ['-0', pid]).status === 0;
+  const app = fs.readFileSync(path.join(dir, '.ironbee', 'app.pid'), 'utf8').trim();
+  const child = fs.readFileSync(path.join(dir, 'child.pid'), 'utf8').trim();
+  spawnSync('sleep', ['0.5']);
+  assert.equal(alive(app), false);
+  assert.equal(alive(child), false);
+});
+
+// A process that leads no group is still stopped, and nothing else is touched.
+test('stop: a process that leads no group is stopped alone', () => {
+  const printed = bash(`
+    sleep 30 & PID=$!
+    stop_app_process "$PID"; wait "$PID" 2>/dev/null
+    if kill -0 "$PID" 2>/dev/null; then echo up; else echo stopped; fi
+    echo still-here
+  `);
+  assert.equal(printed, 'stopped\nstill-here\n');
+});
+
 test('restart: a build that fails on the fixed code fails the restart, and starts nothing', () => {
   const dir = tempDir();
   const printed = bash(`
@@ -211,6 +288,33 @@ test('context: only a repository Bitbucket calls public is not private', () => {
   assert.equal(bash('bitbucket_repository_private false').trim(), 'false');
   assert.equal(bash('bitbucket_repository_private true').trim(), 'true');
   assert.equal(bash('bitbucket_repository_private ""').trim(), 'true');
+});
+
+// A push measures from where it left its destination branch, as the fetch put
+// that branch; nothing when either is unknown, and the plan takes the parent.
+test('context: a push\'s base is the merge base with its destination branch', () => {
+  const dir = tempDir();
+  const git = (...args) => execFileSync('git', args, { cwd: dir, encoding: 'utf8' }).trim();
+  git('init', '-q', '-b', 'main');
+  const commit = (name) => {
+    fs.writeFileSync(path.join(dir, name), `${name}\n`);
+    git('add', '.');
+    git('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '-m', name);
+    return git('rev-parse', 'HEAD');
+  };
+  commit('init');
+  const forkPoint = commit('main-1');
+  git('checkout', '-q', '-b', 'feature');
+  commit('feature-1');
+  const tip = commit('feature-2');
+  git('checkout', '-q', 'main');
+  commit('main-2');
+  git('update-ref', 'refs/remotes/origin/main', 'main');
+
+  assert.equal(bash(`cd "${dir}"; bitbucket_push_base ${tip} main`).trim(), forkPoint);
+  assert.equal(bash(`cd "${dir}"; bitbucket_push_base ${tip} ""`).trim(), '');
+  assert.equal(bash(`cd "${dir}"; bitbucket_push_base ${tip} develop`).trim(), '');
+  assert.equal(bash(`cd "${dir}"; bitbucket_push_base "" main`).trim(), '');
 });
 
 // The step's uuid carries braces, which the link escapes.

@@ -76,7 +76,7 @@ pipelines:
 
 A pipe sees the step's default Bitbucket variables, but a repository variable only when the step passes it, so each one the run needs is named under `variables:`. `BITBUCKET_OAUTH_TOKEN` is the step's own token — see [The token](#the-token). To start the application inside the pipe instead, see [Starting the application in the pipe](#starting-the-application-in-the-pipe).
 
-Pin `:v1` for the latest public release, `:v1.1.1` for an exact one, or `:v0`, the internal line used while a change is tried.
+Pin `:v1` for the latest public release, `:v1.2.0` for an exact one, or `:v0`, the internal line used while a change is tried.
 
 ## Trigger Modes
 
@@ -104,7 +104,7 @@ pipelines:
       - step: *verify
 ```
 
-Runs on a push to the branch. Reviews the pushed commit against its parent — Bitbucket names no commit a push started from, so a push of several commits is measured by its last — and verifies affected pages. If issues are found, creates a new branch with fixes and opens a PR.
+Runs on a push to the branch. Bitbucket names no commit a push started from, so the push is reviewed from where its branch left the repository's main branch — every commit on the branch since then — and, on the main branch itself, against the pushed commit's parent; then it verifies affected pages. If issues are found, creates a new branch with fixes and opens a PR. A push to a long-lived branch other than main (`develop`, `release/*`) is measured from where it left main too, so every push reads all of that branch's unreleased work.
 
 ### Scheduled Smoke Test
 
@@ -248,7 +248,7 @@ A pipe cannot read its step's `max-time`, so the number is printed, not checked.
 
 A preview deployment behind SSO or a protection bypass answers 401 or 403 to the verification, and the run would report on the login page. The pipe refuses that case in preflight, by name. The preflight request carries `APP_HEADERS` and `APP_SECRET_HEADERS` as the platform run does, so a protection they bypass passes it; local mode does not use them, so there a 401 or 403 is refused whatever they hold.
 
-An SSO redirect that answers **200** with a login page cannot be told apart from an application by a status code, so it is not caught — the verdict will describe the login page.
+The preflight follows no redirect — curl would repeat the headers to whatever host it names — so an SSO redirect is logged with its 3xx status and not refused, and a login page served with **200** cannot be told apart from an application by a status code either. Neither is caught, and the verdict will describe the login page.
 
 Two ways past it:
 
@@ -435,7 +435,11 @@ The pipe writes its outputs to `.ironbee/outputs.env` in the clone, which the st
 - **PR trigger** — fixes are committed and pushed to the PR branch
 - **Push / Manual / Scheduled** — fixes go to a new branch and a PR is opened
 
-The pipe performs the commit and the push itself. The agent only edits files.
+The pipe performs the commit and the push itself. The agent only edits files. Only what a fix changed is committed. In platform mode the install and the build run before the fix, so their output is never part of it. In local mode the agent installs, builds and fixes in one run: a run with no fix cycle (a failing verdict, then another) commits nothing, and a fix commit may also carry what the agent's own install or build wrote. Files the running application writes in unignored paths while the fix runs count as changes too, as they always did. With `IRONBEE_EXCLUDE_FILES: false` the IronBee setup files are committed alongside a fix.
+
+### Verifying the same pull request again
+
+A new push, a new pipeline or the re-verification after a fix does not pile up reports. The pipe's report comment is edited in place (after a fix, to the re-verified run, with the run before it linked), and the pull request shows the newest pipeline's result. When the platform publishes the run, it does the same with its own: its IronBee build status on the commit is the newest run's, the earlier run's inline comments are replaced by the new run's, and its summary comment is edited in place. The earlier report stays with its own run — in that step's log and its `report.md` artifact, and as its job in the IronBee Console.
 
 ### Re-verification after a fix
 
