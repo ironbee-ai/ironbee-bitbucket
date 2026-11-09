@@ -1,0 +1,56 @@
+# The pipe's own checks on every push and pull request: the script tests, and
+# the image built and run from this commit on its skipped path.
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # The decision logic the pipe runs on. A broken module here would
+      # otherwise fail in a customer's pipeline rather than in ours.
+      - name: Test the scripts
+        run: |
+          node --test tests/*.test.js
+          bash -n pipe.sh
+          bash -n scripts/run.sh
+
+      - name: Validate pipe.yml
+        run: python3 -c "import yaml; yaml.safe_load(open('pipe.yml'))"
+
+      # The image as a step would start it, with verification switched off:
+      # the plan says "nothing to do" and the pipe ends green, with no IronBee
+      # key and nothing to verify. git may use the file protocol alone, so the
+      # history fetch fails at once rather than asking bitbucket.org.
+      - name: Run the image on its skipped path
+        run: |
+          docker build -t ironbee-bitbucket:smoke .
+          REPO="$(mktemp -d)"
+          git -C "$REPO" init -q
+          git -C "$REPO" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init
+          docker run --rm \
+            --volume "$REPO:/opt/atlassian/pipelines/agent/build" \
+            --workdir /opt/atlassian/pipelines/agent/build \
+            --env BITBUCKET_CLONE_DIR=/opt/atlassian/pipelines/agent/build \
+            --env GIT_ALLOW_PROTOCOL=file \
+            --env BITBUCKET_REPO_FULL_NAME=ironbee-ai/smoke \
+            --env BITBUCKET_REPO_IS_PRIVATE=false \
+            --env BITBUCKET_BRANCH=main \
+            --env BITBUCKET_BUILD_NUMBER=1 \
+            --env BITBUCKET_COMMIT="$(git -C "$REPO" rev-parse HEAD)" \
+            --env VERIFICATION_AUTO=false \
+            ironbee-bitbucket:smoke

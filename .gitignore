@@ -1,0 +1,15 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Node (used only for local tooling if any)
+node_modules/
+
+# IronBee session data
+.ironbee/sessions/

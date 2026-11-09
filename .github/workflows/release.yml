@@ -1,0 +1,81 @@
+# Publishes the pipe's image. On a release tag (v1.2.3) the image is pushed as
+# that tag and as its major line (v1), and the git tag of the line is moved to
+# the same commit; on a moving tag pushed by hand (v0, or v1 itself) the image
+# is pushed as that tag alone. A tag moved with the workflow's own token starts
+# no workflow, so the line tag moved here does not publish twice.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      IMAGE: ghcr.io/${{ github.repository_owner }}/ironbee-bitbucket
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # The image is what a customer's pipeline runs, so it is built only from
+      # a commit whose scripts pass.
+      - name: Test the scripts
+        run: |
+          node --test tests/*.test.js
+          bash -n pipe.sh
+          bash -n scripts/run.sh
+
+      # A release tag must be the version pipe.yml names: the short form
+      # (`pipe: <workspace>/<repository>:<tag>`) reads the image from there.
+      - name: Resolve the tags
+        id: tags
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          TAGS="${IMAGE}:${TAG}"
+          LINE=""
+          if [[ "$TAG" =~ ^v([0-9]+)\.[0-9]+\.[0-9]+$ ]]; then
+            NAMED="$(sed -n 's/^image: *ghcr\.io\/ironbee-ai\/ironbee-bitbucket:\(.*\)$/\1/p' pipe.yml)"
+            if [ "$NAMED" != "$TAG" ]; then
+              echo "::error::pipe.yml names the image ${NAMED}, not ${TAG} — bump its image: before tagging"
+              exit 1
+            fi
+            LINE="v${BASH_REMATCH[1]}"
+            TAGS="${TAGS},${IMAGE}:${LINE}"
+          fi
+          echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
+          echo "line=${LINE}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+
+      - name: Move the line tag
+        if: steps.tags.outputs.line != ''
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -fa "${{ steps.tags.outputs.line }}" -m "Update ${{ steps.tags.outputs.line }} tag" "${GITHUB_SHA}"
+          git push -f origin "refs/tags/${{ steps.tags.outputs.line }}"

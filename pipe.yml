@@ -1,0 +1,124 @@
+# IronBee verification, as a Bitbucket Pipe: the GitHub Action's inputs as the
+# pipe's variables, and its steps in one container (pipe.sh, then
+# scripts/run.sh). There is no `required` here; pipe.sh and resolve-plan.js
+# check what a run cannot do without.
+name: IronBee Verify
+image: ghcr.io/ironbee-ai/ironbee-bitbucket:v1.1.1
+category: Testing
+description: >-
+  Verify code changes against the running application with IronBee, fix what
+  the verification finds, and report on the pull request.
+repository: https://github.com/ironbee-ai/ironbee-bitbucket
+maintainer:
+  name: IronBee
+  website: https://ironbee.ai
+vendor:
+  name: IronBee
+  website: https://ironbee.ai
+tags:
+  - ironbee
+  - verification
+  - testing
+  - ai
+variables:
+  # ── Where the verification runs ────────────────────────────────────
+  - name: VERIFICATION_MODE
+    default: 'auto'
+
+  # ── IronBee — account & endpoints ──────────────────────────────────
+  - name: IRONBEE_API_KEY
+    default: '${IRONBEE_API_KEY}'
+  - name: IRONBEE_API_URL
+    default: ''
+  - name: IRONBEE_COLLECTOR_URL
+    default: ''
+  - name: IRONBEE_CONSOLE_URL
+    default: ''
+  - name: IRONBEE_CLI_VERSION
+    default: 'latest'
+  - name: IRONBEE_PROJECT
+    default: ''
+  - name: IRONBEE_ENVIRONMENT
+    default: ''
+
+  # ── IronBee — the verification job (platform mode only) ────────────
+  - name: IRONBEE_BIND_REPOSITORY
+    default: 'true'
+  - name: IRONBEE_JOB_TIMEOUT_MINUTES
+    default: ''
+
+  # ── IronBee — DevTools platforms (local mode only) ─────────────────
+  - name: IRONBEE_BROWSER_DEVTOOLS
+    default: 'true'
+  - name: IRONBEE_BACKEND_DEVTOOLS
+    default: 'false'
+  - name: IRONBEE_NODE_DEVTOOLS
+    default: 'false'
+  - name: IRONBEE_PYTHON_DEVTOOLS
+    default: 'false'
+  - name: IRONBEE_TERMINAL_DEVTOOLS
+    default: 'false'
+
+  # ── IronBee — config & repo hygiene ────────────────────────────────
+  - name: IRONBEE_EXTRA_CONFIG
+    default: ''
+  - name: IRONBEE_EXCLUDE_FILES
+    default: 'true'
+
+  # ── Claude Code — auth ─────────────────────────────────────────────
+  - name: ANTHROPIC_API_KEY
+    default: '${ANTHROPIC_API_KEY}'
+  - name: CLAUDE_CODE_OAUTH_TOKEN
+    default: '${CLAUDE_CODE_OAUTH_TOKEN}'
+
+  # ── Claude Code — install & runtime (local mode only) ──────────────
+  - name: CLAUDE_CODE_CLI_VERSION
+    default: 'latest'
+  - name: CLAUDE_CODE_MODEL
+    default: ''
+  - name: CLAUDE_CODE_MAX_TURNS
+    default: '100'
+  - name: CLAUDE_CODE_ARGS
+    default: ''
+
+  # ── What to verify, and what to do about it ────────────────────────
+  - name: VERIFICATION_PROMPT
+    default: ''
+  - name: VERIFICATION_AUTO
+    default: 'true'
+  - name: VERIFICATION_APPLY_FIX
+    default: 'true'
+
+  # ── Application under test ─────────────────────────────────────────
+  - name: APP_INSTALL_COMMAND
+    default: ''
+  - name: APP_BUILD_COMMAND
+    default: ''
+  - name: APP_START_COMMAND
+    default: ''
+  - name: APP_URL
+    default: ''
+  - name: APP_PORT
+    default: ''
+  - name: APP_RESTART_COMMAND
+    default: ''
+  - name: APP_LOGS_COMMAND
+    default: ''
+  - name: APP_WAIT_SECONDS
+    default: ''
+  - name: APP_HEADERS
+    default: ''
+  - name: APP_SECRET_HEADERS
+    default: ''
+
+  # ── Bitbucket ──────────────────────────────────────────────────────
+  - name: BITBUCKET_OAUTH_TOKEN
+    default: '${BITBUCKET_OAUTH_TOKEN}'
+  - name: EVENT_NAME
+    default: ''
+
+  # ── Pipe — general behaviour ───────────────────────────────────────
+  - name: WORKING_DIRECTORY
+    default: '.'
+  - name: VERBOSE
+    default: 'false'
